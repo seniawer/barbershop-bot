@@ -18,6 +18,8 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+import db
+
 dp = Dispatcher()
 
 # Главное меню: кнопки под полем ввода сообщения
@@ -52,22 +54,18 @@ class Booking(StatesGroup):
     time = State()
 
 
-# Записи клиентов. Пока храним в памяти — после перезапуска бота они пропадут.
-# id клиента в Telegram -> список записей {"id", "service", "date", "time"}
-bookings: dict[int, list[dict]] = {}
-next_booking_id = 1
-
-
 cancel_button = InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
 
 
 def free_times(day: date) -> list[str]:
-    """Время для записи на день. Для сегодняшнего дня — только то, что ещё не прошло."""
+    """Свободное время на день: не занятое другими клиентами и (для сегодня) ещё не прошедшее."""
     now = datetime.now()
+    busy = db.busy_times(day.isoformat())
     return [
-        f"{hour:02d}:00"
+        time
         for hour in WORK_HOURS
-        if day != now.date() or hour > now.hour
+        if (day != now.date() or hour > now.hour)
+        and (time := f"{hour:02d}:00") not in busy
     ]
 
 
@@ -87,7 +85,7 @@ def services_keyboard() -> InlineKeyboardMarkup:
 def dates_keyboard() -> InlineKeyboardMarkup:
     today = date.today()
     days = [today + timedelta(days=i) for i in range(DAYS_AHEAD)]
-    # Сегодняшний день не показываем, если свободного времени уже не осталось
+    # Не показываем дни, где свободного времени не осталось (всё прошло или занято)
     buttons = [
         InlineKeyboardButton(text=format_date(day), callback_data=f"date:{day.isoformat()}")
         for day in days
@@ -158,7 +156,8 @@ async def choose_service(callback: CallbackQuery, state: FSMContext) -> None:
 async def choose_date(callback: CallbackQuery, state: FSMContext) -> None:
     day = date.fromisoformat(callback.data.split(":", 1)[1])
     if not free_times(day):
-        await callback.answer("На этот день время уже прошло, выберите другой", show_alert=True)
+        await callback.answer("На этот день свободного времени нет, выберите другой", show_alert=True)
+        await callback.message.edit_reply_markup(reply_markup=dates_keyboard())
         return
     await state.update_data(date=day.isoformat())
     await state.set_state(Booking.time)
@@ -179,15 +178,15 @@ async def choose_time(callback: CallbackQuery, state: FSMContext) -> None:
     time = callback.data.split(":", 1)[1]
     data = await state.get_data()
     day = date.fromisoformat(data["date"])
-    if time not in free_times(day):
-        await callback.answer("Это время уже прошло, выберите другое", show_alert=True)
+    # Пока клиент выбирал, это время мог занять кто-то другой — проверяем ещё раз.
+    # add_booking тоже вернёт False, если кто-то успел записаться в ту же секунду.
+    if time not in free_times(day) or not db.add_booking(
+        callback.from_user.id, data["service"], data["date"], time
+    ):
+        await callback.answer("Это время уже занято или прошло, выберите другое", show_alert=True)
+        await callback.message.edit_reply_markup(reply_markup=times_keyboard(day))
         return
     name, price = SERVICES[data["service"]]
-    global next_booking_id
-    bookings.setdefault(callback.from_user.id, []).append(
-        {"id": next_booking_id, "service": data["service"], "date": data["date"], "time": time}
-    )
-    next_booking_id += 1
     await state.clear()
     await callback.message.edit_text(
         f"Вы записаны на {format_date(day)} в {time} ✅\n"
@@ -206,9 +205,8 @@ async def cancel_booking(callback: CallbackQuery, state: FSMContext) -> None:
 @dp.message(F.text == "Мои записи")
 async def my_bookings(message: Message, state: FSMContext) -> None:
     await state.clear()
-    user_bookings = sorted(
-        bookings.get(message.from_user.id, []), key=lambda b: (b["date"], b["time"])
-    )
+    # Прошедшие дни не показываем — только сегодняшние и будущие записи
+    user_bookings = db.user_bookings(message.from_user.id, date.today().isoformat())
     if not user_bookings:
         await message.answer("У вас пока нет записей. Нажмите «Записаться», чтобы выбрать время.")
         return
@@ -231,12 +229,10 @@ async def my_bookings(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("unbook:"))
 async def unbook(callback: CallbackQuery) -> None:
     booking_id = int(callback.data.split(":", 1)[1])
-    user_bookings = bookings.get(callback.from_user.id, [])
-    booking = next((b for b in user_bookings if b["id"] == booking_id), None)
+    booking = db.delete_booking(booking_id, callback.from_user.id)
     if booking is None:
         await callback.answer("Эта запись уже отменена", show_alert=True)
         return
-    user_bookings.remove(booking)
     name, _ = SERVICES[booking["service"]]
     day = date.fromisoformat(booking["date"])
     await callback.message.edit_text(
@@ -258,6 +254,7 @@ async def main() -> None:
     if not token:
         sys.exit("Не найден BOT_TOKEN. Создайте файл .env по образцу .env.example")
 
+    db.init_db()
     bot = Bot(token=token)
     await dp.start_polling(bot)
 
