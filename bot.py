@@ -2,10 +2,20 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import date, datetime, timedelta
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from dotenv import load_dotenv
 
 dp = Dispatcher()
@@ -19,9 +29,90 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+# Услуги и цены (пока прямо в коде): код услуги -> (название, цена в рублях)
+SERVICES = {
+    "haircut": ("Мужская стрижка", 1500),
+    "beard": ("Стрижка бороды", 800),
+    "combo": ("Стрижка + борода", 2000),
+    "kids": ("Детская стрижка", 1000),
+    "buzz": ("Стрижка машинкой", 700),
+}
+
+# Сколько дней вперёд можно записаться и в какие часы работает барбершоп
+DAYS_AHEAD = 7
+WORK_HOURS = range(10, 20)  # с 10:00, последняя запись в 19:00
+
+WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+# Шаги записи. FSM запоминает, на каком из них сейчас клиент
+class Booking(StatesGroup):
+    service = State()
+    date = State()
+    time = State()
+
+
+# Записи клиентов. Пока храним в памяти — после перезапуска бота они пропадут.
+# id клиента в Telegram -> список записей {"id", "service", "date", "time"}
+bookings: dict[int, list[dict]] = {}
+next_booking_id = 1
+
+
+cancel_button = InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
+
+
+def free_times(day: date) -> list[str]:
+    """Время для записи на день. Для сегодняшнего дня — только то, что ещё не прошло."""
+    now = datetime.now()
+    return [
+        f"{hour:02d}:00"
+        for hour in WORK_HOURS
+        if day != now.date() or hour > now.hour
+    ]
+
+
+def format_date(day: date) -> str:
+    return f"{WEEKDAYS[day.weekday()]} {day:%d.%m}"
+
+
+def services_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"{name} — {price} ₽", callback_data=f"service:{code}")]
+        for code, (name, price) in SERVICES.items()
+    ]
+    rows.append([cancel_button])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def dates_keyboard() -> InlineKeyboardMarkup:
+    today = date.today()
+    days = [today + timedelta(days=i) for i in range(DAYS_AHEAD)]
+    # Сегодняшний день не показываем, если свободного времени уже не осталось
+    buttons = [
+        InlineKeyboardButton(text=format_date(day), callback_data=f"date:{day.isoformat()}")
+        for day in days
+        if free_times(day)
+    ]
+    # По 3 кнопки в ряд
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([cancel_button])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def times_keyboard(day: date) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(text=time, callback_data=f"time:{time}")
+        for time in free_times(day)
+    ]
+    # По 4 кнопки в ряд
+    rows = [buttons[i : i + 4] for i in range(0, len(buttons), 4)]
+    rows.append([cancel_button])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 @dp.message(CommandStart())
-async def start(message: Message) -> None:
+async def start(message: Message, state: FSMContext) -> None:
+    await state.clear()
     name = message.from_user.first_name if message.from_user else "гость"
     await message.answer(
         f"Здравствуйте, {name}! 👋\n"
@@ -29,6 +120,135 @@ async def start(message: Message) -> None:
         "Выберите действие в меню ниже.",
         reply_markup=main_menu,
     )
+
+
+@dp.message(F.text == "Услуги и цены")
+async def show_services(message: Message) -> None:
+    lines = [f"• {name} — {price} ₽" for name, price in SERVICES.values()]
+    await message.answer("💈 Наши услуги и цены:\n\n" + "\n".join(lines))
+
+
+# Шаг 1: клиент нажал «Записаться» — предлагаем выбрать услугу
+@dp.message(F.text == "Записаться")
+async def booking_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(Booking.service)
+    await message.answer("Выберите услугу:", reply_markup=services_keyboard())
+
+
+# Шаг 2: услуга выбрана — предлагаем дату
+@dp.callback_query(Booking.service, F.data.startswith("service:"))
+async def choose_service(callback: CallbackQuery, state: FSMContext) -> None:
+    code = callback.data.split(":", 1)[1]
+    if code not in SERVICES:
+        await callback.answer("Такой услуги нет", show_alert=True)
+        return
+    await state.update_data(service=code)
+    await state.set_state(Booking.date)
+    name, price = SERVICES[code]
+    await callback.message.edit_text(
+        f"Услуга: {name} — {price} ₽\n\nВыберите дату:",
+        reply_markup=dates_keyboard(),
+    )
+    await callback.answer()
+
+
+# Шаг 3: дата выбрана — предлагаем время
+@dp.callback_query(Booking.date, F.data.startswith("date:"))
+async def choose_date(callback: CallbackQuery, state: FSMContext) -> None:
+    day = date.fromisoformat(callback.data.split(":", 1)[1])
+    if not free_times(day):
+        await callback.answer("На этот день время уже прошло, выберите другой", show_alert=True)
+        return
+    await state.update_data(date=day.isoformat())
+    await state.set_state(Booking.time)
+    data = await state.get_data()
+    name, price = SERVICES[data["service"]]
+    await callback.message.edit_text(
+        f"Услуга: {name} — {price} ₽\n"
+        f"Дата: {format_date(day)}\n\n"
+        "Выберите время:",
+        reply_markup=times_keyboard(day),
+    )
+    await callback.answer()
+
+
+# Шаг 4: время выбрано — подтверждаем запись
+@dp.callback_query(Booking.time, F.data.startswith("time:"))
+async def choose_time(callback: CallbackQuery, state: FSMContext) -> None:
+    time = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    day = date.fromisoformat(data["date"])
+    if time not in free_times(day):
+        await callback.answer("Это время уже прошло, выберите другое", show_alert=True)
+        return
+    name, price = SERVICES[data["service"]]
+    global next_booking_id
+    bookings.setdefault(callback.from_user.id, []).append(
+        {"id": next_booking_id, "service": data["service"], "date": data["date"], "time": time}
+    )
+    next_booking_id += 1
+    await state.clear()
+    await callback.message.edit_text(
+        f"Вы записаны на {format_date(day)} в {time} ✅\n"
+        f"Услуга: {name} — {price} ₽"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "cancel")
+async def cancel_booking(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text("Запись отменена.")
+    await callback.answer()
+
+
+@dp.message(F.text == "Мои записи")
+async def my_bookings(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user_bookings = sorted(
+        bookings.get(message.from_user.id, []), key=lambda b: (b["date"], b["time"])
+    )
+    if not user_bookings:
+        await message.answer("У вас пока нет записей. Нажмите «Записаться», чтобы выбрать время.")
+        return
+    await message.answer("📋 Ваши записи:")
+    # Каждую запись отдельным сообщением, чтобы кнопка отмены была прямо под ней
+    for booking in user_bookings:
+        name, price = SERVICES[booking["service"]]
+        day = date.fromisoformat(booking["date"])
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Отменить запись", callback_data=f"unbook:{booking['id']}")]
+            ]
+        )
+        await message.answer(
+            f"{name} — {price} ₽\n{format_date(day)} в {booking['time']}",
+            reply_markup=keyboard,
+        )
+
+
+@dp.callback_query(F.data.startswith("unbook:"))
+async def unbook(callback: CallbackQuery) -> None:
+    booking_id = int(callback.data.split(":", 1)[1])
+    user_bookings = bookings.get(callback.from_user.id, [])
+    booking = next((b for b in user_bookings if b["id"] == booking_id), None)
+    if booking is None:
+        await callback.answer("Эта запись уже отменена", show_alert=True)
+        return
+    user_bookings.remove(booking)
+    name, _ = SERVICES[booking["service"]]
+    day = date.fromisoformat(booking["date"])
+    await callback.message.edit_text(
+        f"Запись отменена ❌\n{name}, {format_date(day)} в {booking['time']}"
+    )
+    await callback.answer()
+
+
+# Нажата кнопка из старого сообщения, когда клиент уже на другом шаге
+@dp.callback_query()
+async def outdated_button(callback: CallbackQuery) -> None:
+    await callback.answer("Эта кнопка устарела. Нажмите «Записаться» ещё раз.", show_alert=True)
 
 
 async def main() -> None:
