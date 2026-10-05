@@ -5,7 +5,8 @@ import sys
 from datetime import date, datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -15,6 +16,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    User,
 )
 from dotenv import load_dotenv
 
@@ -46,6 +48,9 @@ WORK_HOURS = range(10, 20)  # с 10:00, последняя запись в 19:00
 
 WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
+# Telegram ID администратора из .env (задаётся в main). None — уведомления не отправляются
+ADMIN_ID: int | None = None
+
 
 # Шаги записи. FSM запоминает, на каком из них сейчас клиент
 class Booking(StatesGroup):
@@ -71,6 +76,24 @@ def free_times(day: date) -> list[str]:
 
 def format_date(day: date) -> str:
     return f"{WEEKDAYS[day.weekday()]} {day:%d.%m}"
+
+
+def client_name(user: User) -> str:
+    """Имя клиента для администратора: «Иван Петров (@ivan)»."""
+    if user.username:
+        return f"{user.full_name} (@{user.username})"
+    return user.full_name
+
+
+async def notify_admin(bot: Bot, text: str) -> None:
+    """Отправляет сообщение администратору, если ADMIN_ID задан."""
+    if ADMIN_ID is None:
+        return
+    try:
+        await bot.send_message(ADMIN_ID, text)
+    except TelegramAPIError as error:
+        # Например, админ ещё не нажал /start у бота. Клиенту это не мешает — только пишем в лог
+        logging.warning("Не удалось уведомить администратора: %s", error)
 
 
 def services_keyboard() -> InlineKeyboardMarkup:
@@ -118,6 +141,12 @@ async def start(message: Message, state: FSMContext) -> None:
         "Выберите действие в меню ниже.",
         reply_markup=main_menu,
     )
+
+
+# /id — показывает пользователю его Telegram ID (нужен для ADMIN_ID в .env)
+@dp.message(Command("id"))
+async def show_id(message: Message) -> None:
+    await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
 
 
 @dp.message(F.text == "Услуги и цены")
@@ -193,6 +222,14 @@ async def choose_time(callback: CallbackQuery, state: FSMContext) -> None:
         f"Услуга: {name} — {price} ₽"
     )
     await callback.answer()
+    await notify_admin(
+        callback.bot,
+        "🆕 Новая запись\n"
+        f"Услуга: {name} — {price} ₽\n"
+        f"Дата: {format_date(day)}\n"
+        f"Время: {time}\n"
+        f"Клиент: {client_name(callback.from_user)}",
+    )
 
 
 @dp.callback_query(F.data == "cancel")
@@ -239,6 +276,14 @@ async def unbook(callback: CallbackQuery) -> None:
         f"Запись отменена ❌\n{name}, {format_date(day)} в {booking['time']}"
     )
     await callback.answer()
+    await notify_admin(
+        callback.bot,
+        "❌ Клиент отменил запись\n"
+        f"Услуга: {name}\n"
+        f"Дата: {format_date(day)}\n"
+        f"Время: {booking['time']}\n"
+        f"Клиент: {client_name(callback.from_user)}",
+    )
 
 
 # Нажата кнопка из старого сообщения, когда клиент уже на другом шаге
@@ -248,11 +293,19 @@ async def outdated_button(callback: CallbackQuery) -> None:
 
 
 async def main() -> None:
+    global ADMIN_ID
     # Читаем токен из файла .env, чтобы не хранить его в коде
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
     if not token:
         sys.exit("Не найден BOT_TOKEN. Создайте файл .env по образцу .env.example")
+
+    # ADMIN_ID необязателен: если он пустой, бот просто не шлёт уведомления
+    admin_id = os.getenv("ADMIN_ID", "").strip()
+    if admin_id:
+        if not admin_id.isdigit():
+            sys.exit("ADMIN_ID в .env должен быть числом. Узнать свой ID можно командой /id")
+        ADMIN_ID = int(admin_id)
 
     db.init_db()
     bot = Bot(token=token)
