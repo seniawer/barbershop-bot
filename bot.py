@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
@@ -411,8 +412,9 @@ async def outdated_button(callback: CallbackQuery) -> None:
 
 async def main() -> None:
     global ADMIN_ID
-    # Читаем токен из файла .env, чтобы не хранить его в коде
-    load_dotenv()
+    # Читаем настройки из файла .env рядом с bot.py, чтобы не хранить токен в коде.
+    # Переменные, уже заданные в окружении (например, в systemd), имеют приоритет
+    load_dotenv(Path(__file__).with_name(".env"))
     token = os.getenv("BOT_TOKEN")
     if not token:
         sys.exit("Не найден BOT_TOKEN. Создайте файл .env по образцу .env.example")
@@ -425,6 +427,7 @@ async def main() -> None:
         ADMIN_ID = int(admin_id)
 
     db.init_db()
+    logging.info("База данных: %s", db.db_path())
     bot = Bot(token=token)
     await dp.start_polling(bot)
 

@@ -1,17 +1,28 @@
-"""Хранение записей клиентов в базе SQLite (файл barbershop.db рядом с ботом)."""
+"""Хранение записей клиентов в базе SQLite (по умолчанию файл barbershop.db рядом с ботом)."""
 
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-DB_PATH = Path(__file__).with_name("barbershop.db")
+BOT_DIR = Path(__file__).parent
+
+
+def db_path() -> Path:
+    """Путь к файлу базы: из переменной DB_PATH, иначе barbershop.db рядом с ботом.
+
+    Читаем при каждом вызове, а не при импорте: .env загружается позже, в main()."""
+    value = os.getenv("DB_PATH", "").strip() or "barbershop.db"
+    # Относительный путь считаем от папки бота, а не от текущей папки терминала.
+    # Абсолютный путь (например /var/lib/...) при таком сложении остаётся как есть
+    return BOT_DIR / Path(value).expanduser()
 
 
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
     """Открывает базу, сохраняет изменения и закрывает её после блока with."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path())
     # Строки из базы можно читать по имени колонки: row["date"]
     conn.row_factory = sqlite3.Row
     try:
@@ -23,6 +34,8 @@ def connect() -> Iterator[sqlite3.Connection]:
 
 def init_db() -> None:
     """Создаёт таблицу при первом запуске. Если она уже есть — ничего не делает."""
+    # Папку для базы создаём заранее, если в DB_PATH указана ещё несуществующая
+    db_path().parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
         # UNIQUE (date, time): база сама не даст записать двух клиентов на одно время
         conn.execute(
