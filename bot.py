@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta
 
@@ -17,6 +19,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     User,
+    WebAppInfo,
 )
 from dotenv import load_dotenv
 
@@ -27,7 +30,7 @@ dp = Dispatcher()
 # Главное меню: кнопки под полем ввода сообщения
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Записаться")],
+        [KeyboardButton(text="Записаться"), KeyboardButton(text="Записаться онлайн")],
         [KeyboardButton(text="Мои записи"), KeyboardButton(text="Услуги и цены")],
     ],
     resize_keyboard=True,
@@ -47,6 +50,9 @@ DAYS_AHEAD = 7
 WORK_HOURS = range(10, 20)  # с 10:00, последняя запись в 19:00
 
 WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+# Адрес мини-приложения (Telegram Mini App) с онлайн-записью. Страница публичная
+MINIAPP_URL = "https://seniawer.github.io/barbershop-miniapp/"
 
 # Telegram ID администратора из .env (задаётся в main). None — уведомления не отправляются
 ADMIN_ID: int | None = None
@@ -94,6 +100,26 @@ async def notify_admin(bot: Bot, text: str) -> None:
     except TelegramAPIError as error:
         # Например, админ ещё не нажал /start у бота. Клиенту это не мешает — только пишем в лог
         logging.warning("Не удалось уведомить администратора: %s", error)
+
+
+def miniapp_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура с кнопкой мини-приложения. Адрес собирается заново при каждом вызове,
+    чтобы страница получила актуальный список занятых слотов: ?busy=2026-10-07_15:00,...
+    Кнопка именно в reply-клавиатуре: из inline-кнопки Telegram.WebApp.sendData не работает."""
+    today = date.today()
+    busy = [
+        f"{day.isoformat()}_{time}"
+        for day in (today + timedelta(days=i) for i in range(DAYS_AHEAD))
+        for time in sorted(db.busy_times(day.isoformat()))
+    ]
+    url = MINIAPP_URL + ("?busy=" + ",".join(busy) if busy else "")
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📅 Открыть онлайн-запись", web_app=WebAppInfo(url=url))],
+            [KeyboardButton(text="⬅️ Главное меню")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def services_keyboard() -> InlineKeyboardMarkup:
@@ -229,6 +255,97 @@ async def choose_time(callback: CallbackQuery, state: FSMContext) -> None:
         f"Дата: {format_date(day)}\n"
         f"Время: {time}\n"
         f"Клиент: {client_name(callback.from_user)}",
+    )
+
+
+# Онлайн-запись: клиент нажал «Записаться онлайн» — даём кнопку, открывающую мини-приложение
+@dp.message(F.text == "Записаться онлайн")
+async def miniapp_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Нажмите кнопку ниже: откроется страница записи. "
+        "Выберите услугу, день и время и подтвердите запись.",
+        reply_markup=miniapp_keyboard(),
+    )
+
+
+@dp.message(F.text == "⬅️ Главное меню")
+async def back_to_menu(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Главное меню.", reply_markup=main_menu)
+
+
+def parse_miniapp_booking(raw: str) -> tuple[str, date, str] | None:
+    """Проверяет данные из мини-приложения и возвращает (код услуги, дата, время).
+    None — если данные неверные. Странице не доверяем: её JSON может подделать кто угодно."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    service, day, time = data.get("service"), data.get("date"), data.get("time")
+    if not all(isinstance(value, str) for value in (service, day, time)):
+        return None
+
+    # Страница присылает название услуги («Мужская стрижка»). Ищем его в SERVICES.
+    # Цену из JSON не используем вовсе — она всегда берётся из SERVICES
+    code = next((code for code, (name, _) in SERVICES.items() if name == service), None)
+    if code is None:
+        return None
+
+    # Дата строго ГГГГ-ММ-ДД и в пределах ближайших DAYS_AHEAD дней (начиная с сегодня)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return None
+    try:
+        day = date.fromisoformat(day)
+    except ValueError:
+        return None
+    if not 0 <= (day - date.today()).days < DAYS_AHEAD:
+        return None
+
+    # Время строго ЧЧ:00 и в рабочие часы
+    match = re.fullmatch(r"(\d{2}):00", time)
+    if match is None or int(match.group(1)) not in WORK_HOURS:
+        return None
+    return code, day, time
+
+
+# Мини-приложение прислало выбор клиента (Telegram.WebApp.sendData)
+@dp.message(F.web_app_data)
+async def miniapp_booking(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    booking = parse_miniapp_booking(message.web_app_data.data)
+    if booking is None:
+        await message.answer(
+            "Не получилось разобрать запись. Попробуйте ещё раз.",
+            reply_markup=miniapp_keyboard(),
+        )
+        return
+    code, day, time = booking
+    # Как и в пошаговой записи: время не должно пройти или быть занятым,
+    # а add_booking вернёт False, если кто-то успел записаться в ту же секунду
+    if time not in free_times(day) or not db.add_booking(
+        message.from_user.id, code, day.isoformat(), time
+    ):
+        await message.answer(
+            "Это время уже занято или прошло 😔 Выберите другое — список свободного времени обновлён.",
+            reply_markup=miniapp_keyboard(),
+        )
+        return
+    name, price = SERVICES[code]
+    await message.answer(
+        f"Вы записаны на {format_date(day)} в {time} ✅\n"
+        f"Услуга: {name} — {price} ₽",
+        reply_markup=main_menu,
+    )
+    await notify_admin(
+        message.bot,
+        "🆕 Новая запись (онлайн)\n"
+        f"Услуга: {name} — {price} ₽\n"
+        f"Дата: {format_date(day)}\n"
+        f"Время: {time}\n"
+        f"Клиент: {client_name(message.from_user)}",
     )
 
 
