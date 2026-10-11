@@ -156,6 +156,47 @@ async def notify_admin(bot: Bot, text: str) -> None:
         logging.warning("Не удалось уведомить администратора: %s", error)
 
 
+def phone_line(phone: str | None) -> str:
+    """Строка с телефоном клиента для мастера. Пустая, если клиент номером не поделился."""
+    return f"\nТелефон: {phone}" if phone else ""
+
+
+def booking_start_time(day: str | date, time: str) -> datetime:
+    """Начало записи. Время — как и везде в боте, по часам компьютера (datetime.now())."""
+    if isinstance(day, str):
+        day = date.fromisoformat(day)
+    return datetime.combine(day, datetime.strptime(time, "%H:%M").time())
+
+
+def reminders_to_skip(day: date, time: str) -> tuple[bool, bool]:
+    """Какие напоминания не нужны новой записи: (за сутки, за 2 часа).
+    До записи меньше 24 часов — за сутки не шлём, меньше 2 часов — не шлём никаких."""
+    left = booking_start_time(day, time) - datetime.now()
+    return left < timedelta(hours=24), left < timedelta(hours=2)
+
+
+# Клавиатура с просьбой поделиться номером. request_contact отправляет только свой контакт
+phone_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📱 Поделиться номером", request_contact=True)],
+        [KeyboardButton(text="Пропустить")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+
+async def ask_phone_once(message: Message, user: User) -> None:
+    """После первой записи просим номер телефона. Если уже спрашивали — ничего не делаем."""
+    if not db.should_ask_phone(user.id):
+        return
+    await message.answer(
+        "Оставьте, пожалуйста, номер телефона — мастер сможет связаться с вами, "
+        "если что-то изменится. Номер спрашиваем один раз.",
+        reply_markup=phone_keyboard,
+    )
+
+
 def miniapp_keyboard() -> ReplyKeyboardMarkup:
     """Клавиатура с кнопкой мини-приложения. Адрес собирается заново при каждом вызове,
     чтобы страница получила актуальный список занятых слотов: ?busy=2026-10-07_15:00,...
@@ -297,6 +338,7 @@ async def choose_time(callback: CallbackQuery, state: FSMContext) -> None:
         time,
         callback.from_user.full_name,
         callback.from_user.username,
+        *reminders_to_skip(day, time),
     ):
         await callback.answer("Это время уже занято или прошло, выберите другое", show_alert=True)
         await callback.message.edit_reply_markup(reply_markup=times_keyboard(day))
@@ -314,8 +356,10 @@ async def choose_time(callback: CallbackQuery, state: FSMContext) -> None:
         f"Услуга: {name} — {price} ₽\n"
         f"Дата: {format_date(day)}\n"
         f"Время: {time}\n"
-        f"Клиент: {client_name(callback.from_user)}",
+        f"Клиент: {client_name(callback.from_user)}"
+        + phone_line(db.client_phone(callback.from_user.id)),
     )
+    await ask_phone_once(callback.message, callback.from_user)
 
 
 # Онлайн-запись: клиент нажал «Записаться онлайн» — даём кнопку, открывающую мини-приложение
@@ -392,6 +436,7 @@ async def miniapp_booking(message: Message, state: FSMContext) -> None:
         time,
         message.from_user.full_name,
         message.from_user.username,
+        *reminders_to_skip(day, time),
     ):
         await message.answer(
             "Это время уже занято или прошло 😔 Выберите другое — список свободного времени обновлён.",
@@ -410,7 +455,38 @@ async def miniapp_booking(message: Message, state: FSMContext) -> None:
         f"Услуга: {name} — {price} ₽\n"
         f"Дата: {format_date(day)}\n"
         f"Время: {time}\n"
-        f"Клиент: {client_name(message.from_user)}",
+        f"Клиент: {client_name(message.from_user)}"
+        + phone_line(db.client_phone(message.from_user.id)),
+    )
+    await ask_phone_once(message, message.from_user)
+
+
+# Клиент нажал «Поделиться номером». Принимаем только его собственный контакт:
+# переслать чужой контакт кнопкой нельзя, но можно вручную через «Прикрепить»
+@dp.message(F.contact)
+async def save_contact(message: Message) -> None:
+    contact = message.contact
+    if contact.user_id != message.from_user.id:
+        await message.answer(
+            "Пожалуйста, отправьте свой номер кнопкой «📱 Поделиться номером».",
+            reply_markup=phone_keyboard,
+        )
+        return
+    phone = contact.phone_number
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    db.save_phone(message.from_user.id, phone)
+    await message.answer("Спасибо, номер сохранён ✅", reply_markup=menu_for(message.from_user))
+    await notify_admin(
+        message.bot,
+        f"📱 Клиент {client_name(message.from_user)} оставил номер: {phone}",
+    )
+
+
+@dp.message(F.text == "Пропустить")
+async def skip_phone(message: Message) -> None:
+    await message.answer(
+        "Хорошо, без номера. Главное меню.", reply_markup=menu_for(message.from_user)
     )
 
 
@@ -458,14 +534,180 @@ async def unbook(callback: CallbackQuery) -> None:
         f"Запись отменена ❌\n{name}, {format_date(day)} в {booking['time']}"
     )
     await callback.answer()
+    await notify_admin_cancelled(callback.bot, callback.from_user, booking)
+
+
+async def notify_admin_cancelled(bot: Bot, user: User, booking, source: str = "") -> None:
+    """Уведомление мастеру: клиент отменил запись (source — откуда, например «из напоминания»)."""
+    name, _ = SERVICES[booking["service"]]
     await notify_admin(
-        callback.bot,
-        "❌ Клиент отменил запись\n"
+        bot,
+        f"❌ Клиент отменил запись{source}\n"
         f"Услуга: {name}\n"
-        f"Дата: {format_date(day)}\n"
+        f"Дата: {format_date(date.fromisoformat(booking['date']))}\n"
         f"Время: {booking['time']}\n"
-        f"Клиент: {client_name(callback.from_user)}",
+        f"Клиент: {client_name(user)}"
+        + phone_line(db.client_phone(user.id)),
     )
+
+
+# ---------------- Напоминания клиенту ----------------
+# За 24 часа и за 2 часа до записи. Отметки об отправке — в колонках reminded_24h / reminded_2h.
+# callback_data кнопок напоминания начинается с «rem:»
+
+REMINDERS = [
+    # (колонка-отметка, за сколько до записи)
+    ("reminded_24h", timedelta(hours=24)),
+    ("reminded_2h", timedelta(hours=2)),
+]
+
+
+def when_text(day: date) -> str:
+    """«сегодня», «завтра» или дата."""
+    days = (day - date.today()).days
+    if days == 0:
+        return "сегодня"
+    if days == 1:
+        return "завтра"
+    return format_date(day)
+
+
+def reminder_view(booking) -> tuple[str, InlineKeyboardMarkup]:
+    """Текст напоминания и кнопки «Приду ✅» / «Отменить запись»."""
+    name, price = SERVICES[booking["service"]]
+    day = date.fromisoformat(booking["date"])
+    text = (
+        f"⏰ Напоминаем: {when_text(day)}, {format_date(day)}, в {booking['time']} "
+        f"у вас запись в барбершоп.\nУслуга: {name} — {price} ₽\n\n"
+        "Пожалуйста, подтвердите визит."
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Приду ✅", callback_data=f"rem:yes:{booking['id']}")],
+            [InlineKeyboardButton(text="Отменить запись", callback_data=f"rem:cancel:{booking['id']}")],
+        ]
+    )
+    return text, keyboard
+
+
+async def send_reminder(bot: Bot, booking) -> bool:
+    """Отправляет напоминание клиенту. False — если не получилось (например, бот заблокирован)."""
+    text, keyboard = reminder_view(booking)
+    try:
+        await bot.send_message(booking["user_id"], text, reply_markup=keyboard)
+        return True
+    except TelegramAPIError as error:
+        logging.warning("Не удалось отправить напоминание по записи %s: %s", booking["id"], error)
+        return False
+
+
+async def check_reminders(bot: Bot) -> None:
+    """Отправляет напоминания, срок которых наступил. Запись, до которой меньше 2 часов,
+    получает только напоминание за 2 часа: «суточное» для неё уже не актуально."""
+    now = datetime.now()
+    today = now.date()
+    bookings = db.bookings_to_remind(today.isoformat(), (today + timedelta(days=1)).isoformat())
+    for booking in bookings:
+        start = booking_start_time(booking["date"], booking["time"])
+        if start <= now:
+            continue
+        due = [column for column, before in REMINDERS if now >= start - before]
+        if not due:
+            continue  # до записи больше 24 часов
+        # Шлём только самое позднее из наступивших напоминаний, а более ранние
+        # отмечаем без отправки, чтобы не прислать два подряд
+        *earlier, column = due
+        for skipped in earlier:
+            db.mark_reminded(booking["id"], skipped)
+        # Сначала отметка, потом отправка: если бот упадёт между ними,
+        # напоминание пропадёт, но не придёт дважды
+        if db.mark_reminded(booking["id"], column):
+            await send_reminder(bot, booking)
+
+
+async def reminders_loop(bot: Bot) -> None:
+    """Фоновая проверка напоминаний раз в минуту."""
+    while True:
+        try:
+            await check_reminders(bot)
+        except Exception:
+            # Ошибка в одной проверке не должна остановить напоминания совсем
+            logging.exception("Ошибка при проверке напоминаний")
+        await asyncio.sleep(60)
+
+
+@dp.callback_query(F.data.startswith("rem:yes:"))
+async def reminder_confirm(callback: CallbackQuery) -> None:
+    booking = db.user_booking(int(callback.data.split(":")[2]), callback.from_user.id)
+    if booking is None:
+        await callback.answer("Эта запись уже отменена", show_alert=True)
+        return
+    newly_confirmed = db.confirm_booking(booking["id"], callback.from_user.id)
+    text, _ = reminder_view(booking)
+    await callback.message.edit_text(text.rsplit("\n\n", 1)[0] + "\n\nЖдём вас! ✅")
+    await callback.answer("Ждём вас!")
+    if newly_confirmed:
+        name, _ = SERVICES[booking["service"]]
+        await notify_admin(
+            callback.bot,
+            "✅ Клиент подтвердил визит\n"
+            f"Услуга: {name}\n"
+            f"Дата: {format_date(date.fromisoformat(booking['date']))}\n"
+            f"Время: {booking['time']}\n"
+            f"Клиент: {client_name(callback.from_user)}"
+            + phone_line(booking["phone"]),
+        )
+
+
+# Отмена из напоминания. Шаг 1: спрашиваем подтверждение
+@dp.callback_query(F.data.startswith("rem:cancel:"))
+async def reminder_cancel_ask(callback: CallbackQuery) -> None:
+    booking = db.user_booking(int(callback.data.split(":")[2]), callback.from_user.id)
+    if booking is None:
+        await callback.answer("Эта запись уже отменена", show_alert=True)
+        return
+    name, _ = SERVICES[booking["service"]]
+    day = date.fromisoformat(booking["date"])
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, отменить", callback_data=f"rem:cancel_yes:{booking['id']}")],
+            [InlineKeyboardButton(text="Нет, оставить", callback_data=f"rem:cancel_no:{booking['id']}")],
+        ]
+    )
+    await callback.message.edit_text(
+        f"Отменить запись на {format_date(day)} в {booking['time']} ({name})?",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+# Шаг 2а: клиент передумал — возвращаем напоминание с кнопками
+@dp.callback_query(F.data.startswith("rem:cancel_no:"))
+async def reminder_cancel_no(callback: CallbackQuery) -> None:
+    booking = db.user_booking(int(callback.data.split(":")[2]), callback.from_user.id)
+    if booking is None:
+        await callback.answer("Эта запись уже отменена", show_alert=True)
+        return
+    text, keyboard = reminder_view(booking)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# Шаг 2б: подтверждено — удаляем запись и сообщаем мастеру
+@dp.callback_query(F.data.startswith("rem:cancel_yes:"))
+async def reminder_cancel_yes(callback: CallbackQuery) -> None:
+    booking = db.delete_booking(int(callback.data.split(":")[2]), callback.from_user.id)
+    if booking is None:
+        await callback.answer("Эта запись уже отменена", show_alert=True)
+        return
+    name, _ = SERVICES[booking["service"]]
+    day = date.fromisoformat(booking["date"])
+    await callback.message.edit_text(
+        f"Запись отменена ❌\n{name}, {format_date(day)} в {booking['time']}\n"
+        "Записаться снова можно кнопкой «Записаться»."
+    )
+    await callback.answer()
+    await notify_admin_cancelled(callback.bot, callback.from_user, booking, " (из напоминания)")
 
 
 # ---------------- Меню мастера ----------------
@@ -506,7 +748,12 @@ async def day_report(bot: Bot, day: date) -> tuple[str, InlineKeyboardMarkup | N
         name, price = SERVICES[booking["service"]]
         total += price
         client = await booking_client(bot, booking)
-        lines.append(f"{booking['time']} — {name}, {price} ₽\n      {client}")
+        line = f"{booking['time']} — {name}, {price} ₽\n      {client}"
+        if booking["phone"]:
+            line += f"\n      📱 {booking['phone']}"
+        if booking["confirmed"]:
+            line += "\n      ✅ подтвердил визит"
+        lines.append(line)
         buttons.append(
             [
                 InlineKeyboardButton(
@@ -528,6 +775,33 @@ async def master_menu_open(message: Message, state: FSMContext) -> None:
 
 @dp.message(Command("admin"))
 async def master_menu_denied(message: Message) -> None:
+    await message.answer("Эта команда доступна только мастеру.")
+
+
+# /test_reminder — сразу отправить напоминание по ближайшей записи (для проверки).
+# Отметку в базе не ставит: обычные напоминания по этой записи придут как положено
+@dp.message(Command("test_reminder"), IsAdmin())
+async def test_reminder(message: Message) -> None:
+    now = datetime.now()
+    upcoming = [
+        booking
+        for booking in db.bookings_between(now.date().isoformat(), "9999-12-31")
+        if booking_start_time(booking["date"], booking["time"]) > now
+    ]
+    if not upcoming:
+        await message.answer("Предстоящих записей нет — напоминание отправлять некому.")
+        return
+    booking = upcoming[0]
+    client = await booking_client(message.bot, booking)
+    when = f"{format_date(date.fromisoformat(booking['date']))} в {booking['time']}"
+    if await send_reminder(message.bot, booking):
+        await message.answer(f"Напоминание по записи {when} отправлено: {client}.")
+    else:
+        await message.answer(f"Не удалось отправить напоминание по записи {when} ({client}), см. лог.")
+
+
+@dp.message(Command("test_reminder"))
+async def test_reminder_denied(message: Message) -> None:
     await message.answer("Эта команда доступна только мастеру.")
 
 
@@ -595,8 +869,9 @@ async def master_cancel_ask(callback: CallbackQuery) -> None:
         "Отменить запись?\n\n"
         f"{format_date(day)} в {booking['time']}\n"
         f"{name} — {price} ₽\n"
-        f"Клиент: {client}\n\n"
-        "Клиенту придёт сообщение об отмене.",
+        f"Клиент: {client}"
+        + phone_line(booking["phone"])
+        + "\n\nКлиенту придёт сообщение об отмене.",
         reply_markup=keyboard,
     )
     await callback.answer()
@@ -874,7 +1149,13 @@ async def main() -> None:
     db.init_db()
     logging.info("База данных: %s", db.db_path())
     bot = Bot(token=token)
-    await dp.start_polling(bot)
+    # Напоминания проверяются в фоне, пока бот принимает сообщения.
+    # Ссылку на задачу храним, чтобы её не удалил сборщик мусора
+    reminders = asyncio.create_task(reminders_loop(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        reminders.cancel()
 
 
 if __name__ == "__main__":
