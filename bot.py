@@ -8,8 +8,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandStart
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.filters import Command, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -29,10 +29,24 @@ import db
 dp = Dispatcher()
 
 # Главное меню: кнопки под полем ввода сообщения
-main_menu = ReplyKeyboardMarkup(
+CLIENT_MENU_ROWS = [
+    [KeyboardButton(text="Записаться"), KeyboardButton(text="Записаться онлайн")],
+    [KeyboardButton(text="Мои записи"), KeyboardButton(text="Услуги и цены")],
+]
+main_menu = ReplyKeyboardMarkup(keyboard=CLIENT_MENU_ROWS, resize_keyboard=True)
+# То же меню для администратора — с кнопкой «Меню мастера»
+admin_main_menu = ReplyKeyboardMarkup(
+    keyboard=[*CLIENT_MENU_ROWS, [KeyboardButton(text="Меню мастера")]],
+    resize_keyboard=True,
+)
+
+# Меню мастера (только для администратора)
+master_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Записаться"), KeyboardButton(text="Записаться онлайн")],
-        [KeyboardButton(text="Мои записи"), KeyboardButton(text="Услуги и цены")],
+        [KeyboardButton(text="Записи на сегодня"), KeyboardButton(text="На завтра")],
+        [KeyboardButton(text="На неделю")],
+        [KeyboardButton(text="Закрыть время"), KeyboardButton(text="Закрытое время")],
+        [KeyboardButton(text="Клиентское меню")],
     ],
     resize_keyboard=True,
 )
@@ -49,14 +63,36 @@ SERVICES = {
 # Сколько дней вперёд можно записаться и в какие часы работает барбершоп
 DAYS_AHEAD = 7
 WORK_HOURS = range(10, 20)  # с 10:00, последняя запись в 19:00
+WORK_TIMES = [f"{hour:02d}:00" for hour in WORK_HOURS]
+# На сколько дней вперёд мастер может закрыть время
+CLOSE_DAYS_AHEAD = 14
 
 WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 # Адрес мини-приложения (Telegram Mini App) с онлайн-записью. Страница публичная
 MINIAPP_URL = "https://seniawer.github.io/barbershop-miniapp/"
 
-# Telegram ID администратора из .env (задаётся в main). None — уведомления не отправляются
+# Telegram ID администратора из .env (задаётся в main).
+# None — уведомления не отправляются и меню мастера недоступно
 ADMIN_ID: int | None = None
+
+
+def is_admin(user: User | None) -> bool:
+    return ADMIN_ID is not None and user is not None and user.id == ADMIN_ID
+
+
+class IsAdmin(Filter):
+    """Пропускает сообщение или нажатие кнопки, только если его прислал администратор.
+    Стоит на каждом обработчике меню мастера: скрытой кнопки мало, текст «Меню мастера»
+    или callback_data «adm:...» может отправить кто угодно."""
+
+    async def __call__(self, event: Message | CallbackQuery) -> bool:
+        return is_admin(event.from_user)
+
+
+def menu_for(user: User | None) -> ReplyKeyboardMarkup:
+    """Главное меню: у администратора в нём есть кнопка «Меню мастера»."""
+    return admin_main_menu if is_admin(user) else main_menu
 
 
 # Шаги записи. FSM запоминает, на каком из них сейчас клиент
@@ -69,10 +105,23 @@ class Booking(StatesGroup):
 cancel_button = InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
 
 
+def closed_hours(day: date) -> set[str]:
+    """Часы, которые мастер закрыл на этот день (если закрыт весь день — все рабочие часы)."""
+    closed = db.closed_times(day.isoformat())
+    if db.WHOLE_DAY in closed:
+        return set(WORK_TIMES)
+    return closed
+
+
+def unavailable_times(day: date) -> set[str]:
+    """Время, на которое записаться нельзя: занято другим клиентом или закрыто мастером."""
+    return db.busy_times(day.isoformat()) | closed_hours(day)
+
+
 def free_times(day: date) -> list[str]:
-    """Свободное время на день: не занятое другими клиентами и (для сегодня) ещё не прошедшее."""
+    """Свободное время на день: не занятое, не закрытое мастером и (для сегодня) ещё не прошедшее."""
     now = datetime.now()
-    busy = db.busy_times(day.isoformat())
+    busy = unavailable_times(day)
     return [
         time
         for hour in WORK_HOURS
@@ -87,9 +136,13 @@ def format_date(day: date) -> str:
 
 def client_name(user: User) -> str:
     """Имя клиента для администратора: «Иван Петров (@ivan)»."""
-    if user.username:
-        return f"{user.full_name} (@{user.username})"
-    return user.full_name
+    return format_client(user.full_name, user.username)
+
+
+def format_client(name: str, username: str | None) -> str:
+    if username:
+        return f"{name} (@{username})"
+    return name
 
 
 async def notify_admin(bot: Bot, text: str) -> None:
@@ -106,12 +159,13 @@ async def notify_admin(bot: Bot, text: str) -> None:
 def miniapp_keyboard() -> ReplyKeyboardMarkup:
     """Клавиатура с кнопкой мини-приложения. Адрес собирается заново при каждом вызове,
     чтобы страница получила актуальный список занятых слотов: ?busy=2026-10-07_15:00,...
+    Закрытое мастером время передаётся как занятое: для клиента разницы нет.
     Кнопка именно в reply-клавиатуре: из inline-кнопки Telegram.WebApp.sendData не работает."""
     today = date.today()
     busy = [
         f"{day.isoformat()}_{time}"
         for day in (today + timedelta(days=i) for i in range(DAYS_AHEAD))
-        for time in sorted(db.busy_times(day.isoformat()))
+        for time in sorted(unavailable_times(day))
     ]
     url = MINIAPP_URL + ("?busy=" + ",".join(busy) if busy else "")
     return ReplyKeyboardMarkup(
@@ -166,7 +220,7 @@ async def start(message: Message, state: FSMContext) -> None:
         f"Здравствуйте, {name}! 👋\n"
         "Я бот барбершопа. Помогу записаться на стрижку.\n"
         "Выберите действие в меню ниже.",
-        reply_markup=main_menu,
+        reply_markup=menu_for(message.from_user),
     )
 
 
@@ -237,7 +291,12 @@ async def choose_time(callback: CallbackQuery, state: FSMContext) -> None:
     # Пока клиент выбирал, это время мог занять кто-то другой — проверяем ещё раз.
     # add_booking тоже вернёт False, если кто-то успел записаться в ту же секунду.
     if time not in free_times(day) or not db.add_booking(
-        callback.from_user.id, data["service"], data["date"], time
+        callback.from_user.id,
+        data["service"],
+        data["date"],
+        time,
+        callback.from_user.full_name,
+        callback.from_user.username,
     ):
         await callback.answer("Это время уже занято или прошло, выберите другое", show_alert=True)
         await callback.message.edit_reply_markup(reply_markup=times_keyboard(day))
@@ -273,7 +332,7 @@ async def miniapp_start(message: Message, state: FSMContext) -> None:
 @dp.message(F.text == "⬅️ Главное меню")
 async def back_to_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Главное меню.", reply_markup=main_menu)
+    await message.answer("Главное меню.", reply_markup=menu_for(message.from_user))
 
 
 def parse_miniapp_booking(raw: str) -> tuple[str, date, str] | None:
@@ -327,7 +386,12 @@ async def miniapp_booking(message: Message, state: FSMContext) -> None:
     # Как и в пошаговой записи: время не должно пройти или быть занятым,
     # а add_booking вернёт False, если кто-то успел записаться в ту же секунду
     if time not in free_times(day) or not db.add_booking(
-        message.from_user.id, code, day.isoformat(), time
+        message.from_user.id,
+        code,
+        day.isoformat(),
+        time,
+        message.from_user.full_name,
+        message.from_user.username,
     ):
         await message.answer(
             "Это время уже занято или прошло 😔 Выберите другое — список свободного времени обновлён.",
@@ -338,7 +402,7 @@ async def miniapp_booking(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"Вы записаны на {format_date(day)} в {time} ✅\n"
         f"Услуга: {name} — {price} ₽",
-        reply_markup=main_menu,
+        reply_markup=menu_for(message.from_user),
     )
     await notify_admin(
         message.bot,
@@ -402,6 +466,387 @@ async def unbook(callback: CallbackQuery) -> None:
         f"Время: {booking['time']}\n"
         f"Клиент: {client_name(callback.from_user)}",
     )
+
+
+# ---------------- Меню мастера ----------------
+# Все обработчики ниже работают только для администратора (фильтр IsAdmin()).
+# callback_data кнопок мастера начинается с «adm:».
+
+
+def plural_bookings(count: int) -> str:
+    """1 запись, 2 записи, 5 записей."""
+    if count % 10 == 1 and count % 100 != 11:
+        return f"{count} запись"
+    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        return f"{count} записи"
+    return f"{count} записей"
+
+
+async def booking_client(bot: Bot, booking) -> str:
+    """Имя и ник клиента записи. У записей, сделанных до появления меню мастера,
+    имени в базе нет — спрашиваем его у Telegram, а если не вышло, показываем ID."""
+    if booking["client_name"]:
+        return format_client(booking["client_name"], booking["client_username"])
+    try:
+        chat = await bot.get_chat(booking["user_id"])
+        return format_client(chat.full_name, chat.username)
+    except TelegramAPIError:
+        return f"клиент ID {booking['user_id']}"
+
+
+async def day_report(bot: Bot, day: date) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Записи на день для мастера: текст и кнопки «Отменить» под каждой записью."""
+    bookings = db.bookings_between(day.isoformat(), day.isoformat())
+    if not bookings:
+        return f"📅 {format_date(day)}\n\nЗаписей нет.", None
+    lines = [f"📅 {format_date(day)}\n"]
+    buttons = []
+    total = 0
+    for booking in bookings:
+        name, price = SERVICES[booking["service"]]
+        total += price
+        client = await booking_client(bot, booking)
+        lines.append(f"{booking['time']} — {name}, {price} ₽\n      {client}")
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"Отменить {booking['time']} — {client}",
+                    callback_data=f"adm:cancel:{booking['id']}",
+                )
+            ]
+        )
+    lines.append(f"\nИтого: {plural_bookings(len(bookings))} на {total} ₽")
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(Command("admin"), IsAdmin())
+@dp.message(F.text == "Меню мастера", IsAdmin())
+async def master_menu_open(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Меню мастера.", reply_markup=master_menu)
+
+
+@dp.message(Command("admin"))
+async def master_menu_denied(message: Message) -> None:
+    await message.answer("Эта команда доступна только мастеру.")
+
+
+@dp.message(F.text == "Клиентское меню", IsAdmin())
+async def master_to_client_menu(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Клиентское меню.", reply_markup=menu_for(message.from_user))
+
+
+@dp.message(F.text.in_({"Записи на сегодня", "На завтра"}), IsAdmin())
+async def master_day_bookings(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    day = date.today()
+    if message.text == "На завтра":
+        day += timedelta(days=1)
+    text, keyboard = await day_report(message.bot, day)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.message(F.text == "На неделю", IsAdmin())
+async def master_week_bookings(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    today = date.today()
+    days = [today + timedelta(days=i) for i in range(DAYS_AHEAD)]
+    bookings = db.bookings_between(days[0].isoformat(), days[-1].isoformat())
+    if not bookings:
+        await message.answer(
+            f"На неделю ({format_date(days[0])} — {format_date(days[-1])}) записей нет."
+        )
+        return
+    # Каждый день с записями — отдельным сообщением со своими кнопками «Отменить»
+    booked_days = {booking["date"] for booking in bookings}
+    for day in days:
+        if day.isoformat() in booked_days:
+            text, keyboard = await day_report(message.bot, day)
+            await message.answer(text, reply_markup=keyboard)
+    total = sum(SERVICES[booking["service"]][1] for booking in bookings)
+    free_days = [format_date(day) for day in days if day.isoformat() not in booked_days]
+    summary = (
+        f"Итого за неделю ({format_date(days[0])} — {format_date(days[-1])}): "
+        f"{plural_bookings(len(bookings))} на {total} ₽"
+    )
+    if free_days:
+        summary += "\nБез записей: " + ", ".join(free_days)
+    await message.answer(summary)
+
+
+# Отмена записи мастером. Шаг 1: спрашиваем подтверждение в том же сообщении
+@dp.callback_query(F.data.startswith("adm:cancel:"), IsAdmin())
+async def master_cancel_ask(callback: CallbackQuery) -> None:
+    booking = db.booking(int(callback.data.split(":")[2]))
+    if booking is None:
+        await callback.answer("Эта запись уже отменена", show_alert=True)
+        return
+    name, price = SERVICES[booking["service"]]
+    day = date.fromisoformat(booking["date"])
+    client = await booking_client(callback.bot, booking)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, отменить запись", callback_data=f"adm:cancel_yes:{booking['id']}")],
+            [InlineKeyboardButton(text="Нет, оставить", callback_data=f"adm:cancel_no:{booking['date']}")],
+        ]
+    )
+    await callback.message.edit_text(
+        "Отменить запись?\n\n"
+        f"{format_date(day)} в {booking['time']}\n"
+        f"{name} — {price} ₽\n"
+        f"Клиент: {client}\n\n"
+        "Клиенту придёт сообщение об отмене.",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+# Шаг 2а: мастер передумал — возвращаем список записей на этот день
+@dp.callback_query(F.data.startswith("adm:cancel_no:"), IsAdmin())
+async def master_cancel_no(callback: CallbackQuery) -> None:
+    day = date.fromisoformat(callback.data.split(":")[2])
+    text, keyboard = await day_report(callback.bot, day)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# Шаг 2б: подтверждено — удаляем запись, пишем клиенту, обновляем список
+@dp.callback_query(F.data.startswith("adm:cancel_yes:"), IsAdmin())
+async def master_cancel_yes(callback: CallbackQuery) -> None:
+    booking = db.cancel_booking(int(callback.data.split(":")[2]))
+    if booking is None:
+        await callback.answer("Эта запись уже отменена", show_alert=True)
+        return
+    name, _ = SERVICES[booking["service"]]
+    day = date.fromisoformat(booking["date"])
+    try:
+        await callback.bot.send_message(
+            booking["user_id"],
+            f"Мастер отменил вашу запись на {format_date(day)} в {booking['time']} ({name}). "
+            "Приносим извинения! Выбрать другое время можно кнопкой «Записаться».",
+        )
+        result = "клиент уведомлён"
+    except TelegramAPIError as error:
+        # Например, клиент заблокировал бота. Запись всё равно отменена
+        logging.warning("Не удалось уведомить клиента об отмене: %s", error)
+        result = "но сообщение клиенту отправить не удалось"
+    text, keyboard = await day_report(callback.bot, day)
+    await callback.message.edit_text(
+        f"❌ Запись на {booking['time']} отменена, {result}.\n\n{text}",
+        reply_markup=keyboard,
+    )
+    await callback.answer("Запись отменена")
+
+
+# ---------------- Закрытие времени ----------------
+
+
+def close_days_keyboard() -> InlineKeyboardMarkup:
+    """Выбор дня для закрытия на CLOSE_DAYS_AHEAD дней вперёд.
+    🔒 — день закрыт целиком, 🔸 — закрыты отдельные часы."""
+    today = date.today()
+    buttons = []
+    for i in range(CLOSE_DAYS_AHEAD):
+        day = today + timedelta(days=i)
+        closed = db.closed_times(day.isoformat())
+        mark = "🔒 " if db.WHOLE_DAY in closed else "🔸 " if closed else ""
+        buttons.append(
+            InlineKeyboardButton(text=mark + format_date(day), callback_data=f"adm:close:{day.isoformat()}")
+        )
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def parse_close_day(raw: str) -> date | None:
+    """Дата из кнопки закрытия времени: ГГГГ-ММ-ДД в пределах CLOSE_DAYS_AHEAD дней."""
+    try:
+        day = date.fromisoformat(raw)
+    except ValueError:
+        return None
+    if not 0 <= (day - date.today()).days < CLOSE_DAYS_AHEAD:
+        return None
+    return day
+
+
+# Отмеченные часы хранятся прямо в callback_data кнопок: «10.11.15» — 10:00, 11:00 и 15:00.
+# Так не нужен FSM, и старые сообщения с кнопками продолжают работать
+def encode_hours(times: set[str]) -> str:
+    return ".".join(str(int(time[:2])) for time in sorted(times))
+
+
+def decode_hours(raw: str) -> set[str] | None:
+    """Обратное к encode_hours. None — если в строке что-то кроме рабочих часов."""
+    if not raw:
+        return set()
+    times = set()
+    for part in raw.split("."):
+        if not part.isdigit() or int(part) not in WORK_HOURS:
+            return None
+        times.add(f"{int(part):02d}:00")
+    return times
+
+
+def close_hours_view(day: date, selected: set[str]) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран выбора часов: «Весь день», часы-переключатели (✅ — будет закрыт) и «Сохранить»."""
+    booked = db.busy_times(day.isoformat())
+    key = day.isoformat()
+    hour_buttons = []
+    for time in WORK_TIMES:
+        toggled = selected ^ {time}  # выбор после нажатия на эту кнопку
+        text = ("✅ " if time in selected else "") + time + (" 👤" if time in booked else "")
+        hour_buttons.append(
+            InlineKeyboardButton(text=text, callback_data=f"adm:hours:{key}:{encode_hours(toggled)}")
+        )
+    rows = [[InlineKeyboardButton(text="🔒 Весь день", callback_data=f"adm:wholeday:{key}")]]
+    rows += [hour_buttons[i : i + 4] for i in range(0, len(hour_buttons), 4)]
+    rows.append([InlineKeyboardButton(text="💾 Сохранить", callback_data=f"adm:save:{key}:{encode_hours(selected)}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К выбору дня", callback_data="adm:closemenu")])
+    text = (
+        f"Закрыть время: {format_date(day)}\n\n"
+        "Нажмите «Весь день» или отметьте часы и нажмите «Сохранить».\n"
+        "👤 — на это время уже есть запись."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def conflicts_warning(bot: Bot, day: date, times: set[str]) -> str:
+    """Предупреждение о записях, которые попали на закрытое время. Сами записи не отменяются."""
+    conflicts = [
+        booking
+        for booking in db.bookings_between(day.isoformat(), day.isoformat())
+        if booking["time"] in times
+    ]
+    if not conflicts:
+        return ""
+    lines = ["\n\n⚠️ На закрытое время уже есть записи. Они НЕ отменены:"]
+    for booking in conflicts:
+        name, price = SERVICES[booking["service"]]
+        client = await booking_client(bot, booking)
+        lines.append(f"• {booking['time']} — {name}, {price} ₽, {client}")
+    lines.append("Отменить их можно в списке записей («Записи на сегодня», «На завтра», «На неделю»).")
+    return "\n".join(lines)
+
+
+@dp.message(F.text == "Закрыть время", IsAdmin())
+async def master_close_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Выберите день, в котором нужно закрыть время:", reply_markup=close_days_keyboard())
+
+
+@dp.callback_query(F.data == "adm:closemenu", IsAdmin())
+async def master_close_menu(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "Выберите день, в котором нужно закрыть время:", reply_markup=close_days_keyboard()
+    )
+    await callback.answer()
+
+
+# День выбран — показываем часы. Уже закрытые часы сразу отмечены
+@dp.callback_query(F.data.startswith("adm:close:"), IsAdmin())
+async def master_close_day(callback: CallbackQuery) -> None:
+    day = parse_close_day(callback.data.split(":")[2])
+    if day is None:
+        await callback.answer("Этот день уже недоступен", show_alert=True)
+        return
+    closed = db.closed_times(day.isoformat())
+    if db.WHOLE_DAY in closed:
+        await callback.answer(
+            "Этот день уже закрыт целиком. Открыть его можно в «Закрытое время».", show_alert=True
+        )
+        return
+    text, keyboard = close_hours_view(day, closed)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# Нажат час-переключатель: перерисовываем кнопки с новым выбором
+@dp.callback_query(F.data.startswith("adm:hours:"), IsAdmin())
+async def master_toggle_hour(callback: CallbackQuery) -> None:
+    _, _, raw_day, raw_hours = callback.data.split(":", 3)
+    day, selected = parse_close_day(raw_day), decode_hours(raw_hours)
+    if day is None or selected is None:
+        await callback.answer("Эта кнопка устарела", show_alert=True)
+        return
+    text, keyboard = close_hours_view(day, selected)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:save:"), IsAdmin())
+async def master_save_hours(callback: CallbackQuery) -> None:
+    _, _, raw_day, raw_hours = callback.data.split(":", 3)
+    day, selected = parse_close_day(raw_day), decode_hours(raw_hours)
+    if day is None or selected is None:
+        await callback.answer("Эта кнопка устарела", show_alert=True)
+        return
+    if not selected and not db.closed_times(day.isoformat()):
+        await callback.answer("Отметьте хотя бы один час или нажмите «Весь день»", show_alert=True)
+        return
+    db.set_closed_hours(day.isoformat(), sorted(selected))
+    if selected:
+        text = f"🔒 {format_date(day)}: закрыто {', '.join(sorted(selected))}."
+    else:
+        text = f"🔓 {format_date(day)}: все часы открыты."
+    text += await conflicts_warning(callback.bot, day, selected)
+    await callback.message.edit_text(text)
+    await callback.answer("Сохранено")
+
+
+@dp.callback_query(F.data.startswith("adm:wholeday:"), IsAdmin())
+async def master_close_whole_day(callback: CallbackQuery) -> None:
+    day = parse_close_day(callback.data.split(":")[2])
+    if day is None:
+        await callback.answer("Этот день уже недоступен", show_alert=True)
+        return
+    db.close_whole_day(day.isoformat())
+    text = f"🔒 {format_date(day)} закрыт целиком. Клиенты этот день не увидят."
+    text += await conflicts_warning(callback.bot, day, set(WORK_TIMES))
+    await callback.message.edit_text(text)
+    await callback.answer("Сохранено")
+
+
+def closed_view() -> tuple[str, InlineKeyboardMarkup | None]:
+    """Список закрытого времени начиная с сегодня, с кнопкой «Открыть» у каждого дня и часа."""
+    rows = db.closed_from(date.today().isoformat())
+    if not rows:
+        return "Закрытого времени нет.", None
+    lines = ["🔒 Закрытое время:\n"]
+    buttons = []
+    by_day: dict[str, list[str]] = {}
+    for row in rows:
+        day = date.fromisoformat(row["date"])
+        what = "весь день" if row["time"] == db.WHOLE_DAY else row["time"]
+        by_day.setdefault(format_date(day), []).append(what)
+        buttons.append(
+            [InlineKeyboardButton(text=f"🔓 Открыть {format_date(day)}, {what}", callback_data=f"adm:open:{row['id']}")]
+        )
+    lines += [f"• {day} — {', '.join(times)}" for day, times in by_day.items()]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(F.text == "Закрытое время", IsAdmin())
+async def master_closed_list(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text, keyboard = closed_view()
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("adm:open:"), IsAdmin())
+async def master_open_time(callback: CallbackQuery) -> None:
+    opened = db.open_time(int(callback.data.split(":")[2]))
+    text, keyboard = closed_view()
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest:
+        pass  # список не изменился (это время уже открыли из другого сообщения)
+    await callback.answer("Открыто" if opened else "Это время уже открыто")
+
+
+# Кнопку мастера нажал не администратор (например, подделал callback_data)
+@dp.callback_query(F.data.startswith("adm:"))
+async def master_button_denied(callback: CallbackQuery) -> None:
+    await callback.answer("Это действие доступно только мастеру.", show_alert=True)
 
 
 # Нажата кнопка из старого сообщения, когда клиент уже на другом шаге
