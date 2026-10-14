@@ -62,6 +62,19 @@ SERVICES = {
     "kids": ("Детская стрижка", 1000),
     "buzz": ("Стрижка машинкой", 700),
 }
+# Сколько минут длится услуга (показывается в мини-приложении). Запись всё равно идёт на час
+SERVICE_MINUTES = {
+    "haircut": 45,
+    "beard": 30,
+    "combo": 60,
+    "kids": 30,
+    "buzz": 20,
+}
+assert SERVICE_MINUTES.keys() == SERVICES.keys(), "у каждой услуги должна быть длительность"
+
+# Название и адрес барбершопа для шапки мини-приложения (пока демо-данные)
+SHOP_NAME = "Барбершоп «Бритва»"
+SHOP_ADDRESS = "ул. Пушкина, 10"
 
 # Сколько дней вперёд можно записаться и в какие часы работает барбершоп
 DAYS_AHEAD = 7
@@ -355,7 +368,8 @@ def miniapp_data(with_descriptions: bool = True) -> dict:
     """Всё, что нужно странице записи: услуги, мастера и их занятые часы на DAYS_AHEAD дней.
     Ключи короткие, а занятость дня — одно число (hours_mask), чтобы адрес оставался коротким:
       v — версия формата, d — первый день, n — сколько дней, h — первый и последний час,
-      s — [[код, название, цена], ...], m — [[id, имя, описание, [занятость по дням]], ...]
+      s — [[код, название, цена, минуты], ...], m — [[id, имя, описание, [занятость по дням]], ...],
+      b — [название барбершопа, адрес]
     Закрытое мастером время передаётся как занятое: для клиента разницы нет."""
     days = booking_days()
     return {
@@ -363,7 +377,7 @@ def miniapp_data(with_descriptions: bool = True) -> dict:
         "d": days[0].isoformat(),
         "n": len(days),
         "h": [WORK_HOURS.start, WORK_HOURS.stop - 1],
-        "s": [[code, name, price] for code, (name, price) in SERVICES.items()],
+        "s": [[code, name, price, SERVICE_MINUTES[code]] for code, (name, price) in SERVICES.items()],
         "m": [
             [
                 master.id,
@@ -373,6 +387,7 @@ def miniapp_data(with_descriptions: bool = True) -> dict:
             ]
             for master in MASTERS.values()
         ],
+        "b": [SHOP_NAME, SHOP_ADDRESS],
     }
 
 
