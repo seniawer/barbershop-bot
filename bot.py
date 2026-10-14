@@ -107,6 +107,10 @@ ANY_MASTER = "any"
 ALL_MASTERS = "all"
 
 
+# Дни недели в masters.json (поле work_days): «пн» ... «вс», номер — как у date.weekday()
+WEEKDAY_KEYS = [day.lower() for day in WEEKDAYS]
+
+
 @dataclass(frozen=True)
 class Master:
     id: str
@@ -114,6 +118,10 @@ class Master:
     description: str = ""
     # Telegram ID мастера: ему приходят уведомления о его записях и доступно меню мастера
     telegram_id: int | None = None
+    # Рабочие дни (0 — пн, как date.weekday()) и часы: с work_hours[0]:00 до work_hours[1]:00,
+    # последняя запись — за час до конца. По умолчанию — все дни и все часы барбершопа
+    work_days: frozenset[int] = frozenset(range(7))
+    work_hours: tuple[int, int] = (WORK_HOURS.start, WORK_HOURS.stop)
 
 
 MASTERS: dict[str, Master] = {}
@@ -153,8 +161,53 @@ def load_masters(path: Path) -> dict[str, Master]:
             not isinstance(telegram_id, int) or isinstance(telegram_id, bool) or telegram_id <= 0
         ):
             raise ValueError(f"telegram_id мастера {master_id!r} должен быть числом или null")
-        masters[master_id] = Master(master_id, name.strip(), description.strip(), telegram_id)
+        work_days = parse_work_days(master_id, item.get("work_days", WEEKDAY_KEYS))
+        work_hours = parse_work_hours(master_id, item.get("work_hours", [WORK_HOURS.start, WORK_HOURS.stop]))
+        masters[master_id] = Master(
+            master_id, name.strip(), description.strip(), telegram_id, work_days, work_hours
+        )
     return masters
+
+
+def parse_work_days(master_id: str, raw) -> frozenset[int]:
+    """work_days из masters.json: непустой список вида ["пн", "вт", ...]."""
+    if not isinstance(raw, list) or not raw or not all(isinstance(day, str) for day in raw):
+        raise ValueError(f"work_days мастера {master_id!r} должно быть списком дней, например [\"пн\", \"вт\"]")
+    days = set()
+    for day in raw:
+        key = day.strip().lower()
+        if key not in WEEKDAY_KEYS:
+            raise ValueError(f"неизвестный день {day!r} в work_days мастера {master_id!r}: нужны пн, вт, ср, чт, пт, сб, вс")
+        days.add(WEEKDAY_KEYS.index(key))
+    return frozenset(days)
+
+
+def parse_work_hours(master_id: str, raw) -> tuple[int, int]:
+    """work_hours из masters.json: [начало, конец] — целые часы в пределах часов работы барбершопа."""
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 2
+        or not all(isinstance(hour, int) and not isinstance(hour, bool) for hour in raw)
+        or not WORK_HOURS.start <= raw[0] < raw[1] <= WORK_HOURS.stop
+    ):
+        raise ValueError(
+            f"work_hours мастера {master_id!r} должно быть [начало, конец] в часах,"
+            f" от {WORK_HOURS.start} до {WORK_HOURS.stop}, например [10, 20]"
+        )
+    return raw[0], raw[1]
+
+
+def format_schedule(master: Master) -> str:
+    """«пн–пт, 10:00–20:00», «вт, чт, сб, 12:00–18:00» или «ежедневно, ...»."""
+    days = sorted(master.work_days)
+    if len(days) == 7:
+        days_text = "ежедневно"
+    elif days == list(range(days[0], days[-1] + 1)) and len(days) > 2:
+        days_text = f"{WEEKDAY_KEYS[days[0]]}–{WEEKDAY_KEYS[days[-1]]}"
+    else:
+        days_text = ", ".join(WEEKDAY_KEYS[day] for day in days)
+    start, end = master.work_hours
+    return f"{days_text}, {start:02d}:00–{end:02d}:00"
 
 
 def master_name(master_id: str) -> str:
@@ -220,9 +273,21 @@ def closed_hours(master_id: str, day: date) -> set[str]:
     return closed
 
 
+def off_hours(master_id: str, day: date) -> set[str]:
+    """Часы, когда мастер не работает по графику из masters.json (выходной — все часы)."""
+    master = MASTERS.get(master_id)
+    if master is None:
+        return set()
+    if day.weekday() not in master.work_days:
+        return set(WORK_TIMES)
+    start, end = master.work_hours
+    return {f"{hour:02d}:00" for hour in WORK_HOURS if not start <= hour < end}
+
+
 def unavailable_times(master_id: str, day: date) -> set[str]:
-    """Время, на которое к мастеру записаться нельзя: занято другим клиентом или закрыто мастером."""
-    return db.busy_times(master_id, day.isoformat()) | closed_hours(master_id, day)
+    """Время, на которое к мастеру записаться нельзя: занято другим клиентом, закрыто мастером
+    или не входит в его рабочий график."""
+    return db.busy_times(master_id, day.isoformat()) | closed_hours(master_id, day) | off_hours(master_id, day)
 
 
 def master_free_times(master_id: str, day: date) -> list[str]:
@@ -489,6 +554,7 @@ async def show_services(message: Message) -> None:
     lines = [f"• {name} — {price} ₽" for name, price in SERVICES.values()]
     masters = [
         f"• {master.name}" + (f" — {master.description}" if master.description else "")
+        + f"\n   🕘 {format_schedule(master)}"
         for master in MASTERS.values()
     ]
     await message.answer(

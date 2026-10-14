@@ -3,18 +3,24 @@
     "id": "alex",
     "name": "Алексей",
     "description": "Классика и фейды, 8 лет опыта",
-    "telegram_id": null
+    "telegram_id": null,
+    "work_days": ["пн", "вт", "ср", "чт", "пт"],
+    "work_hours": [10, 20]
   },
   {
     "id": "boris",
     "name": "Борис",
     "description": "Бороды и опасная бритва",
-    "telegram_id": null
+    "telegram_id": null,
+    "work_days": ["вт", "ср", "чт", "пт", "сб"],
+    "work_hours": [12, 20]
   },
   {
     "id": "vika",
     "name": "Виктория",
     "description": "Модные и детские стрижки",
-    "telegram_id": null
+    "telegram_id": null,
+    "work_days": ["ср", "чт", "пт", "сб", "вс"],
+    "work_hours": [10, 18]
   }
 ]
