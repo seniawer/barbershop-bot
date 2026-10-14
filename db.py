@@ -203,10 +203,41 @@ def user_bookings(user_id: int, from_day: str) -> list[sqlite3.Row]:
     """Записи клиента начиная с указанного дня, по порядку."""
     with connect() as conn:
         return conn.execute(
-            "SELECT id, service, master_id, date, time FROM bookings"
+            "SELECT id, service, master_id, date, time, comment FROM bookings"
             " WHERE user_id = ? AND date >= ? ORDER BY date, time",
             (user_id, from_day),
         ).fetchall()
+
+
+def last_booking(user_id: int) -> sqlite3.Row | None:
+    """Последняя по времени создания запись клиента (для «Записаться снова»). None — записей нет."""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT service, master_id FROM bookings WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+
+
+def reschedule_booking(
+    booking_id: int, user_id: int, day: str, time: str, skip_24h: bool, skip_2h: bool
+) -> bool:
+    """Переносит запись клиента на другое время у того же мастера. False — запись не его (или её нет),
+    новое время у мастера занято или закрыто. Напоминания и подтверждение визита сбрасываются
+    под новое время (skip_24h / skip_2h — как в add_booking)."""
+    try:
+        with connect() as conn:
+            # Проверка закрытого времени — в том же запросе, а занятость проверит UNIQUE (master_id, date, time)
+            cursor = conn.execute(
+                "UPDATE bookings SET date = ?, time = ?, reminded_24h = ?, reminded_2h = ?, confirmed = 0"
+                " WHERE id = ? AND user_id = ? AND NOT EXISTS ("
+                "   SELECT 1 FROM closed_time"
+                "   WHERE closed_time.master_id = bookings.master_id AND closed_time.date = ? AND closed_time.time IN (?, ?)"
+                " )",
+                (day, time, int(skip_24h), int(skip_2h), booking_id, user_id, day, time, WHOLE_DAY),
+            )
+        return cursor.rowcount == 1
+    except sqlite3.IntegrityError:
+        return False
 
 
 def delete_booking(booking_id: int, user_id: int) -> sqlite3.Row | None:

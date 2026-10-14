@@ -72,9 +72,12 @@ SERVICE_MINUTES = {
 }
 assert SERVICE_MINUTES.keys() == SERVICES.keys(), "у каждой услуги должна быть длительность"
 
-# Название и адрес барбершопа для шапки мини-приложения (пока демо-данные)
+# Барбершоп для мини-приложения: шапка и экран «О барбершопе» (пока демо-данные).
+# SHOP_MAP_QUERY — что искать в Яндекс Картах (адрес с городом), часы работы берутся из WORK_HOURS
 SHOP_NAME = "Барбершоп «Бритва»"
 SHOP_ADDRESS = "ул. Пушкина, 10"
+SHOP_PHONE = "+7 (495) 123-45-67"
+SHOP_MAP_QUERY = "Москва, ул. Пушкина, 10"
 
 # Сколько дней вперёд можно записаться и в какие часы работает барбершоп
 DAYS_AHEAD = 7
@@ -448,15 +451,31 @@ def mask_hours(mask: int) -> set[str]:
     return {time for i, time in enumerate(WORK_TIMES) if mask >> i & 1}
 
 
-def miniapp_data(with_descriptions: bool = True) -> dict:
+# Сколько предстоящих записей клиента передавать странице (вкладка «Мои записи»)
+MINIAPP_BOOKINGS_LIMIT = 10
+
+
+def upcoming_bookings(user_id: int) -> list:
+    """Записи клиента, которые ещё не начались, по порядку."""
+    now = datetime.now()
+    return [
+        booking
+        for booking in db.user_bookings(user_id, now.date().isoformat())
+        if booking_start_time(booking["date"], booking["time"]) > now
+    ]
+
+
+def miniapp_data(user_id: int | None = None, with_descriptions: bool = True) -> dict:
     """Всё, что нужно странице записи: услуги, мастера и их занятые часы на DAYS_AHEAD дней.
     Ключи короткие, а занятость дня — одно число (hours_mask), чтобы адрес оставался коротким:
       v — версия формата, d — первый день, n — сколько дней, h — первый и последний час,
       s — [[код, название, цена, минуты], ...], m — [[id, имя, описание, [занятость по дням]], ...],
-      b — [название барбершопа, адрес]
-    Закрытое мастером время передаётся как занятое: для клиента разницы нет."""
+      b — [название барбершопа, адрес, телефон, запрос для Яндекс Карт],
+      u — предстоящие записи клиента [[id, код услуги, id мастера, дата, время], ...],
+      l — услуга и мастер последней записи клиента [код услуги, id мастера] («Записаться снова»)
+    Закрытое мастером и нерабочее время передаётся как занятое: для клиента разницы нет."""
     days = booking_days()
-    return {
+    data = {
         "v": 1,
         "d": days[0].isoformat(),
         "n": len(days),
@@ -471,17 +490,35 @@ def miniapp_data(with_descriptions: bool = True) -> dict:
             ]
             for master in MASTERS.values()
         ],
-        "b": [SHOP_NAME, SHOP_ADDRESS],
+        "b": [SHOP_NAME, SHOP_ADDRESS, SHOP_PHONE, SHOP_MAP_QUERY],
     }
+    if user_id is None:
+        return data
+    # Записи к мастерам и услугам, которых уже нет в списках бота, странице не передаём
+    data["u"] = [
+        [booking["id"], booking["service"], booking["master_id"], booking["date"], booking["time"]]
+        for booking in upcoming_bookings(user_id)
+        if booking["service"] in SERVICES and booking["master_id"] in MASTERS
+    ][:MINIAPP_BOOKINGS_LIMIT]
+    last = db.last_booking(user_id)
+    if last is not None and last["service"] in SERVICES and last["master_id"] in MASTERS:
+        data["l"] = [last["service"], last["master_id"]]
+    return data
 
 
-def miniapp_url() -> str:
+# Вкладки мини-приложения, которые бот может открыть сразу (параметр t)
+MINIAPP_TABS = {"my", "about"}
+
+
+def miniapp_url(user_id: int | None = None, tab: str | None = None) -> str:
     """Адрес страницы записи с данными в параметре d: JSON → UTF-8 → base64url без «=».
+    user_id — чьи записи передать для «Мои записи» и «Записаться снова»; tab — открыть вкладку.
     Если адрес выходит длиннее MINIAPP_URL_LIMIT, описания мастеров не передаются."""
+    suffix = f"&t={tab}" if tab in MINIAPP_TABS else ""
     for with_descriptions in (True, False):
-        raw = json.dumps(miniapp_data(with_descriptions), ensure_ascii=False, separators=(",", ":"))
+        raw = json.dumps(miniapp_data(user_id, with_descriptions), ensure_ascii=False, separators=(",", ":"))
         encoded = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
-        url = f"{MINIAPP_URL}?d={encoded}"
+        url = f"{MINIAPP_URL}?d={encoded}{suffix}"
         if len(url) <= MINIAPP_URL_LIMIT:
             return url
     logging.warning(
@@ -492,14 +529,15 @@ def miniapp_url() -> str:
     return url
 
 
-def miniapp_keyboard() -> ReplyKeyboardMarkup:
+def miniapp_keyboard(user: User | None, tab: str | None = None) -> ReplyKeyboardMarkup:
     """Клавиатура с кнопкой мини-приложения. Адрес собирается заново при каждом вызове,
-    чтобы страница получила актуальные услуги, мастеров и занятые слоты (см. miniapp_url).
+    чтобы страница получила актуальные услуги, мастеров, занятые слоты и записи клиента (см. miniapp_url).
     Кнопка именно в reply-клавиатуре: из inline-кнопки Telegram.WebApp.sendData не работает."""
-    url = miniapp_url()
+    url = miniapp_url(user.id if user else None, tab)
+    text = "📋 Открыть мои записи" if tab == "my" else "📅 Открыть онлайн-запись"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📅 Открыть онлайн-запись", web_app=WebAppInfo(url=url))],
+            [KeyboardButton(text=text, web_app=WebAppInfo(url=url))],
             [KeyboardButton(text="⬅️ Главное меню")],
         ],
         resize_keyboard=True,
@@ -718,8 +756,9 @@ async def miniapp_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "Нажмите кнопку ниже: откроется страница записи. "
-        "Выберите услугу, мастера, день и время и подтвердите запись.",
-        reply_markup=miniapp_keyboard(),
+        "Выберите услугу, мастера, день и время и подтвердите запись. "
+        "Там же — ваши записи (перенос и отмена) и контакты барбершопа.",
+        reply_markup=miniapp_keyboard(message.from_user),
     )
 
 
@@ -729,29 +768,11 @@ async def back_to_menu(message: Message, state: FSMContext) -> None:
     await message.answer("Главное меню.", reply_markup=menu_for(message.from_user))
 
 
-def parse_miniapp_booking(raw: str) -> tuple[str, str, date, str, str | None] | None:
-    """Проверяет данные из мини-приложения и возвращает (код услуги, мастер, дата, время, комментарий).
-    Мастер — id из MASTERS или ANY_MASTER. None — если данные неверные.
-    Странице не доверяем: её JSON может подделать кто угодно."""
-    try:
-        data = json.loads(raw)
-    except ValueError:
+def parse_slot(day, time) -> tuple[date, str] | None:
+    """Дата и время из мини-приложения: ГГГГ-ММ-ДД в пределах ближайших DAYS_AHEAD дней
+    (начиная с сегодня) и ЧЧ:00 в рабочие часы. None — если что-то не так."""
+    if not isinstance(day, str) or not isinstance(time, str):
         return None
-    if not isinstance(data, dict):
-        return None
-    code, master = data.get("service"), data.get("master")
-    day, time = data.get("date"), data.get("time")
-    if not all(isinstance(value, str) for value in (code, master, day, time)):
-        return None
-
-    # Страница присылает код услуги и id мастера — те, что получила от бота в адресе.
-    # Цену и имена из JSON не используем вовсе — они всегда берутся из SERVICES и MASTERS
-    if code not in SERVICES:
-        return None
-    if master != ANY_MASTER and master not in MASTERS:
-        return None
-
-    # Дата строго ГГГГ-ММ-ДД и в пределах ближайших DAYS_AHEAD дней (начиная с сегодня)
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
         return None
     try:
@@ -760,40 +781,175 @@ def parse_miniapp_booking(raw: str) -> tuple[str, str, date, str, str | None] | 
         return None
     if not 0 <= (day - date.today()).days < DAYS_AHEAD:
         return None
-
-    # Время строго ЧЧ:00 и в рабочие часы
     match = re.fullmatch(r"(\d{2}):00", time)
     if match is None or int(match.group(1)) not in WORK_HOURS:
         return None
-    # Комментарий необязателен: чистим и обрезаем, а не отклоняем запись
-    return code, master, day, time, clean_comment(data.get("comment"))
+    return day, time
 
 
-# Мини-приложение прислало выбор клиента (Telegram.WebApp.sendData)
+@dataclass(frozen=True)
+class MiniappAction:
+    """Проверенные данные из мини-приложения. action — book, cancel или reschedule.
+    book: service, master, day, time, comment; cancel: booking_id; reschedule: booking_id, day, time."""
+
+    action: str
+    service: str | None = None
+    master: str | None = None
+    day: date | None = None
+    time: str | None = None
+    comment: str | None = None
+    booking_id: int | None = None
+
+
+def parse_miniapp(raw: str) -> MiniappAction | None:
+    """Проверяет JSON из мини-приложения. None — если данные неверные.
+    Странице не доверяем: её JSON может подделать кто угодно. Без поля action — запись (book):
+    так присылала данные страница до появления «Моих записей»."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    action = data.get("action", "book")
+
+    if action == "book":
+        code, master = data.get("service"), data.get("master")
+        # Страница присылает код услуги и id мастера — те, что получила от бота в адресе.
+        # Цену и имена из JSON не используем вовсе — они всегда берутся из SERVICES и MASTERS
+        if not isinstance(code, str) or code not in SERVICES:
+            return None
+        if not isinstance(master, str) or (master != ANY_MASTER and master not in MASTERS):
+            return None
+        slot = parse_slot(data.get("date"), data.get("time"))
+        if slot is None:
+            return None
+        # Комментарий необязателен: чистим и обрезаем, а не отклоняем запись
+        return MiniappAction("book", code, master, *slot, comment=clean_comment(data.get("comment")))
+
+    # Отмена и перенос — по id записи. Чья это запись, проверяет обработчик
+    booking_id = data.get("id")
+    if not isinstance(booking_id, int) or isinstance(booking_id, bool) or booking_id <= 0:
+        return None
+    if action == "cancel":
+        return MiniappAction("cancel", booking_id=booking_id)
+    if action == "reschedule":
+        slot = parse_slot(data.get("date"), data.get("time"))
+        if slot is None:
+            return None
+        return MiniappAction("reschedule", day=slot[0], time=slot[1], booking_id=booking_id)
+    return None
+
+
+# Мини-приложение прислало действие клиента (Telegram.WebApp.sendData)
 @dp.message(F.web_app_data)
-async def miniapp_booking(message: Message, state: FSMContext) -> None:
+async def miniapp_data_received(message: Message, state: FSMContext) -> None:
     await state.clear()
-    booking = parse_miniapp_booking(message.web_app_data.data)
-    if booking is None:
+    data = parse_miniapp(message.web_app_data.data)
+    if data is None:
         await message.answer(
-            "Не получилось разобрать запись. Попробуйте ещё раз.",
-            reply_markup=miniapp_keyboard(),
+            "Не получилось разобрать данные со страницы. Попробуйте ещё раз.",
+            reply_markup=miniapp_keyboard(message.from_user),
         )
-        return
-    code, master, day, time, comment = booking
-    # Как и в пошаговой записи: book проверяет, что время у мастера не прошло и не занято
+    elif data.action == "book":
+        await miniapp_book(message, data)
+    elif data.action == "cancel":
+        await miniapp_cancel(message, data.booking_id)
+    else:
+        await miniapp_reschedule(message, data)
+
+
+async def miniapp_book(message: Message, data: MiniappAction) -> None:
+    # Как и в пошаговой записи: book проверяет, что время у мастера не прошло, не занято и рабочее
     # (для «Любого мастера» — что свободен хоть кто-то), и сам выбирает мастера
-    master_id = book(message.from_user, code, master, day, time, comment)
+    master_id = book(message.from_user, data.service, data.master, data.day, data.time, data.comment)
     if master_id is None:
         await message.answer(
             "Это время уже занято или прошло 😔 Выберите другое — список свободного времени обновлён.",
-            reply_markup=miniapp_keyboard(),
+            reply_markup=miniapp_keyboard(message.from_user),
         )
         return
     await message.answer(
-        booked_text(code, master_id, day, time, comment), reply_markup=menu_for(message.from_user)
+        booked_text(data.service, master_id, data.day, data.time, data.comment),
+        reply_markup=menu_for(message.from_user),
     )
-    await booking_done(message, message.from_user, code, master_id, day, time, " (онлайн)", comment)
+    await booking_done(
+        message, message.from_user, data.service, master_id, data.day, data.time, " (онлайн)", data.comment
+    )
+
+
+def own_upcoming_booking(booking_id: int, user: User) -> tuple[object | None, str]:
+    """Запись клиента, которую ещё можно отменить или перенести: (запись, "") или (None, причина)."""
+    booking = db.user_booking(booking_id, user.id)
+    if booking is None:
+        return None, "Эта запись не найдена — возможно, её уже отменили."
+    if booking_start_time(booking["date"], booking["time"]) <= datetime.now():
+        return None, "Эта запись уже началась или прошла — изменить её нельзя."
+    return booking, ""
+
+
+async def miniapp_cancel(message: Message, booking_id: int) -> None:
+    """Отмена из «Моих записей». Удаляем только запись этого клиента и только будущую."""
+    user = message.from_user
+    booking, error = own_upcoming_booking(booking_id, user)
+    if booking is not None:
+        booking = db.delete_booking(booking_id, user.id)
+        error = "Эта запись не найдена — возможно, её уже отменили."
+    if booking is None:
+        await message.answer(error, reply_markup=menu_for(user))
+        return
+    name, _ = SERVICES.get(booking["service"], (booking["service"], 0))
+    await message.answer(
+        f"Запись отменена ❌\n{name}, {format_date(date.fromisoformat(booking['date']))} в {booking['time']}\n"
+        f"Мастер: {master_name(booking['master_id'])}",
+        reply_markup=menu_for(user),
+    )
+    await notify_staff_cancelled(message.bot, user, booking, " (онлайн)")
+
+
+async def miniapp_reschedule(message: Message, data: MiniappAction) -> None:
+    """Перенос из «Моих записей» на другое время у того же мастера.
+    Проверяем: запись этого клиента и ещё не началась, новое время другое, рабочее и свободное."""
+    user = message.from_user
+    booking, error = own_upcoming_booking(data.booking_id, user)
+    if booking is None:
+        await message.answer(error, reply_markup=menu_for(user))
+        return
+    master_id = booking["master_id"]
+    old_day = date.fromisoformat(booking["date"])
+    if (old_day, booking["time"]) == (data.day, data.time):
+        await message.answer("Запись и так на это время — ничего не изменилось.", reply_markup=menu_for(user))
+        return
+    # master_free_times учитывает занятость, закрытое и нерабочее время мастера и прошедшие часы.
+    # Сам перенос ещё раз проверяется в базе (UNIQUE и закрытое время) — на случай гонки
+    if master_id not in MASTERS or data.time not in master_free_times(master_id, data.day) or not db.reschedule_booking(
+        booking["id"], user.id, data.day.isoformat(), data.time, *reminders_to_skip(data.day, data.time)
+    ):
+        await message.answer(
+            "Это время у мастера уже занято или недоступно 😔 Выберите другое — расписание обновлено.",
+            reply_markup=miniapp_keyboard(user, "my"),
+        )
+        return
+    name, price = SERVICES.get(booking["service"], (booking["service"], 0))
+    old = f"{format_date(old_day)} в {booking['time']}"
+    new = f"{format_date(data.day)} в {data.time}"
+    await message.answer(
+        f"Запись перенесена 🔁\nБыло: {old}\nСтало: {new}\n"
+        f"Мастер: {master_name(master_id)}\nУслуга: {name} — {price} ₽",
+        reply_markup=menu_for(user),
+    )
+    await notify_staff(
+        message.bot,
+        [master_id],
+        f"🔁 Клиент перенёс запись (онлайн)\n"
+        f"Мастер: {master_name(master_id)}\n"
+        f"Услуга: {name}\n"
+        f"Было: {old}\n"
+        f"Стало: {new}\n"
+        f"Клиент: {client_name(user)}"
+        + phone_line(booking["phone"])
+        + comment_line(booking["comment"]),
+    )
 
 
 # Клиент нажал «Поделиться номером». Принимаем только его собственный контакт:
@@ -855,9 +1011,15 @@ async def my_bookings(message: Message, state: FSMContext) -> None:
         )
         await message.answer(
             f"{name} — {price} ₽\n{format_date(day)} в {booking['time']}\n"
-            f"Мастер: {master_name(booking['master_id'])}",
+            f"Мастер: {master_name(booking['master_id'])}"
+            + comment_line(booking["comment"]),
             reply_markup=keyboard,
         )
+    # Перенос — в мини-приложении: там видно свободное время мастера
+    await message.answer(
+        "Перенести запись на другое время можно в мини-приложении — кнопка «📋 Открыть мои записи» ниже.",
+        reply_markup=miniapp_keyboard(message.from_user, "my"),
+    )
 
 
 @dp.callback_query(F.data.startswith("unbook:"))
