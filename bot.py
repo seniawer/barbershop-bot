@@ -325,7 +325,7 @@ def has_free_time(master: str) -> bool:
     return any(free_times(master, day) for day in booking_days())
 
 
-def book(user: User, service: str, master: str, day: date, time: str) -> str | None:
+def book(user: User, service: str, master: str, day: date, time: str, comment: str | None = None) -> str | None:
     """Записывает клиента и возвращает id мастера, к которому он записан. None — время уже занято.
     Для «Любого мастера» бот сам выбирает свободного: сначала того, у кого в этот день меньше записей,
     при равенстве — по порядку в masters.json. Если кто-то в ту же секунду занял время
@@ -343,6 +343,7 @@ def book(user: User, service: str, master: str, day: date, time: str) -> str | N
             user.full_name,
             user.username,
             *reminders_to_skip(day, time),
+            comment=comment,
         ):
             return master_id
     return None
@@ -381,6 +382,24 @@ async def notify_staff(bot: Bot, master_ids: Iterable[str], text: str, skip: int
 def phone_line(phone: str | None) -> str:
     """Строка с телефоном клиента для мастера. Пустая, если клиент номером не поделился."""
     return f"\nТелефон: {phone}" if phone else ""
+
+
+def comment_line(comment: str | None) -> str:
+    """Строка с комментарием клиента к записи. Пустая, если комментария нет."""
+    return f"\nКомментарий: {comment}" if comment else ""
+
+
+# Комментарий к записи: не длиннее COMMENT_LIMIT символов, без управляющих символов
+COMMENT_LIMIT = 200
+
+
+def clean_comment(raw) -> str | None:
+    """Комментарий из мини-приложения: строка без переводов строк и лишних пробелов,
+    обрезанная до COMMENT_LIMIT. None — если комментария нет или это не строка."""
+    if not isinstance(raw, str):
+        return None
+    text = " ".join("".join(ch if ch.isprintable() else " " for ch in raw).split())
+    return text[:COMMENT_LIMIT] or None
 
 
 def booking_start_time(day: str | date, time: str) -> datetime:
@@ -574,7 +593,16 @@ def booking_header(data: dict) -> str:
     return "\n".join(lines)
 
 
-async def booking_done(message: Message, user: User, code: str, master_id: str, day: date, time: str, source: str) -> None:
+async def booking_done(
+    message: Message,
+    user: User,
+    code: str,
+    master_id: str,
+    day: date,
+    time: str,
+    source: str,
+    comment: str | None = None,
+) -> None:
     """Общий конец записи (кнопками или онлайн): уведомление мастеру и владельцу и вопрос о телефоне.
     Подтверждение клиенту каждый способ показывает сам."""
     name, price = SERVICES[code]
@@ -587,17 +615,19 @@ async def booking_done(message: Message, user: User, code: str, master_id: str, 
         f"Дата: {format_date(day)}\n"
         f"Время: {time}\n"
         f"Клиент: {client_name(user)}"
-        + phone_line(db.client_phone(user.id)),
+        + phone_line(db.client_phone(user.id))
+        + comment_line(comment),
     )
     await ask_phone_once(message, user)
 
 
-def booked_text(code: str, master_id: str, day: date, time: str) -> str:
+def booked_text(code: str, master_id: str, day: date, time: str, comment: str | None = None) -> str:
     name, price = SERVICES[code]
     return (
         f"Вы записаны на {format_date(day)} в {time} ✅\n"
         f"Мастер: {master_name(master_id)}\n"
         f"Услуга: {name} — {price} ₽"
+        + comment_line(comment)
     )
 
 
@@ -699,8 +729,8 @@ async def back_to_menu(message: Message, state: FSMContext) -> None:
     await message.answer("Главное меню.", reply_markup=menu_for(message.from_user))
 
 
-def parse_miniapp_booking(raw: str) -> tuple[str, str, date, str] | None:
-    """Проверяет данные из мини-приложения и возвращает (код услуги, мастер, дата, время).
+def parse_miniapp_booking(raw: str) -> tuple[str, str, date, str, str | None] | None:
+    """Проверяет данные из мини-приложения и возвращает (код услуги, мастер, дата, время, комментарий).
     Мастер — id из MASTERS или ANY_MASTER. None — если данные неверные.
     Странице не доверяем: её JSON может подделать кто угодно."""
     try:
@@ -735,7 +765,8 @@ def parse_miniapp_booking(raw: str) -> tuple[str, str, date, str] | None:
     match = re.fullmatch(r"(\d{2}):00", time)
     if match is None or int(match.group(1)) not in WORK_HOURS:
         return None
-    return code, master, day, time
+    # Комментарий необязателен: чистим и обрезаем, а не отклоняем запись
+    return code, master, day, time, clean_comment(data.get("comment"))
 
 
 # Мини-приложение прислало выбор клиента (Telegram.WebApp.sendData)
@@ -749,10 +780,10 @@ async def miniapp_booking(message: Message, state: FSMContext) -> None:
             reply_markup=miniapp_keyboard(),
         )
         return
-    code, master, day, time = booking
+    code, master, day, time, comment = booking
     # Как и в пошаговой записи: book проверяет, что время у мастера не прошло и не занято
     # (для «Любого мастера» — что свободен хоть кто-то), и сам выбирает мастера
-    master_id = book(message.from_user, code, master, day, time)
+    master_id = book(message.from_user, code, master, day, time, comment)
     if master_id is None:
         await message.answer(
             "Это время уже занято или прошло 😔 Выберите другое — список свободного времени обновлён.",
@@ -760,9 +791,9 @@ async def miniapp_booking(message: Message, state: FSMContext) -> None:
         )
         return
     await message.answer(
-        booked_text(code, master_id, day, time), reply_markup=menu_for(message.from_user)
+        booked_text(code, master_id, day, time, comment), reply_markup=menu_for(message.from_user)
     )
-    await booking_done(message, message.from_user, code, master_id, day, time, " (онлайн)")
+    await booking_done(message, message.from_user, code, master_id, day, time, " (онлайн)", comment)
 
 
 # Клиент нажал «Поделиться номером». Принимаем только его собственный контакт:
@@ -1133,6 +1164,8 @@ async def day_report(
             line += f"\n      📱 {booking['phone']}"
         if booking["confirmed"]:
             line += "\n      ✅ подтвердил визит"
+        if booking["comment"]:
+            line += f"\n      💬 {booking['comment']}"
         lines.append(line)
         buttons.append(
             [

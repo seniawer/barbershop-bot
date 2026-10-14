@@ -86,7 +86,8 @@ def init_db(default_master: str) -> None:
         # визита появились позже, чем таблица. В старой базе добавляем колонки,
         # уже сохранённые записи при этом не меняются
         columns = table_columns(conn, "bookings")
-        for column in ("client_name", "client_username"):
+        # comment — необязательный комментарий клиента к записи (из мини-приложения)
+        for column in ("client_name", "client_username", "comment"):
             if column not in columns:
                 conn.execute(f"ALTER TABLE bookings ADD COLUMN {column} TEXT")
         for column in ("reminded_24h", "reminded_2h", "confirmed"):
@@ -163,6 +164,7 @@ def add_booking(
     client_username: str | None = None,
     skip_24h: bool = False,
     skip_2h: bool = False,
+    comment: str | None = None,
 ) -> bool:
     """Сохраняет запись к мастеру. Возвращает False, если это время у мастера уже занято или закрыто.
     skip_24h / skip_2h — сразу отметить напоминание как ненужное (до записи осталось мало времени)."""
@@ -172,14 +174,15 @@ def add_booking(
             # если мастер закроет час в ту же секунду, запись всё равно не пройдёт
             cursor = conn.execute(
                 "INSERT INTO bookings"
-                " (user_id, service, master_id, date, time, client_name, client_username, reminded_24h, reminded_2h)"
-                " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?"
+                " (user_id, service, master_id, date, time, client_name, client_username, reminded_24h, reminded_2h,"
+                " comment)"
+                " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
                 " WHERE NOT EXISTS ("
                 "   SELECT 1 FROM closed_time WHERE master_id = ? AND date = ? AND time IN (?, ?)"
                 " )",
                 (
                     user_id, service, master_id, day, time, client_name, client_username,
-                    int(skip_24h), int(skip_2h), master_id, day, time, WHOLE_DAY,
+                    int(skip_24h), int(skip_2h), comment, master_id, day, time, WHOLE_DAY,
                 ),
             )
         return cursor.rowcount == 1
@@ -221,7 +224,7 @@ def delete_booking(booking_id: int, user_id: int) -> sqlite3.Row | None:
 # Запись вместе с телефоном клиента (если он им поделился) — для мастера и напоминаний
 BOOKING_COLUMNS = (
     "b.id, b.user_id, b.service, b.master_id, b.date, b.time, b.client_name, b.client_username,"
-    " b.reminded_24h, b.reminded_2h, b.confirmed, c.phone"
+    " b.reminded_24h, b.reminded_2h, b.confirmed, b.comment, c.phone"
 )
 BOOKINGS_WITH_PHONE = "bookings b LEFT JOIN clients c ON c.user_id = b.user_id"
 
