@@ -1,0 +1,20 @@
+[
+  {
+    "id": "alex",
+    "name": "Алексей",
+    "description": "Классика и фейды, 8 лет опыта",
+    "telegram_id": null
+  },
+  {
+    "id": "boris",
+    "name": "Борис",
+    "description": "Бороды и опасная бритва",
+    "telegram_id": null
+  },
+  {
+    "id": "vika",
+    "name": "Виктория",
+    "description": "Модные и детские стрижки",
+    "telegram_id": null
+  }
+]
