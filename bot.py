@@ -53,6 +53,11 @@ master_menu = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+# Меню мастера у владельца — с кнопкой «Статистика»
+owner_master_menu = ReplyKeyboardMarkup(
+    keyboard=[*master_menu.keyboard[:-1], [KeyboardButton(text="Статистика")], master_menu.keyboard[-1]],
+    resize_keyboard=True,
+)
 
 # Услуги и цены (пока прямо в коде): код услуги -> (название, цена в рублях)
 SERVICES = {
@@ -1491,7 +1496,7 @@ async def master_menu_open(message: Message, state: FSMContext) -> None:
     else:
         names = ", ".join(master_name(master_id) for master_id in managed_masters(message.from_user))
         text = f"Меню мастера: {names}."
-    await message.answer(text, reply_markup=master_menu)
+    await message.answer(text, reply_markup=owner_master_menu if is_owner(message.from_user) else master_menu)
 
 
 @dp.message(Command("admin"))
@@ -1530,6 +1535,64 @@ async def test_reminder(message: Message) -> None:
 @dp.message(Command("test_reminder"))
 async def test_reminder_denied(message: Message) -> None:
     await message.answer("Эта команда доступна только мастеру.")
+
+
+# ---------------- Статистика (только владелец) ----------------
+
+
+class IsOwner(Filter):
+    """Пропускает только владельца (ADMIN_ID)."""
+
+    async def __call__(self, event: Message | CallbackQuery) -> bool:
+        return is_owner(event.from_user)
+
+
+MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь",
+          "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+
+
+def money(amount: int) -> str:
+    """18400 → «18 400 ₽»."""
+    return f"{amount:,}".replace(",", " ") + " ₽"
+
+
+def period_stats(title: str, from_day: date, to_day: date) -> str:
+    """Записи и выручка за период: всего и по каждому мастеру (плюс средняя оценка, если есть).
+    Выручка — по текущим ценам SERVICES, в счёт идут и прошедшие, и уже назначенные записи."""
+    bookings = db.bookings_between(from_day.isoformat(), to_day.isoformat(), list(MASTERS))
+    price = lambda booking: SERVICES.get(booking["service"], ("", 0))[1]  # noqa: E731
+    lines = [f"{title}", f"Всего: {plural_bookings(len(bookings))}, {money(sum(map(price, bookings)))}"]
+    for master_id in MASTERS:
+        own = [booking for booking in bookings if booking["master_id"] == master_id]
+        line = f"• {master_name(master_id)}: {plural_bookings(len(own))}, {money(sum(map(price, own)))}"
+        ratings = [booking["rating"] for booking in own if booking["rating"]]
+        if ratings:
+            line += f", ★ {sum(ratings) / len(ratings):.1f}".replace(".", ",") + f" ({len(ratings)} оц.)"
+        lines.append(line)
+    upcoming = sum(booking_start_time(b["date"], b["time"]) > datetime.now() for b in bookings)
+    if upcoming:
+        lines.append(f"Из них ещё впереди: {plural_bookings(upcoming)}")
+    return "\n".join(lines)
+
+
+def stats_text(today: date) -> str:
+    week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=6)
+    month_start = today.replace(day=1)
+    month_end = (month_start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    return (
+        "📊 Статистика\n\n"
+        + period_stats(f"Неделя: {format_date(week_start)} — {format_date(week_end)}", week_start, week_end)
+        + "\n\n"
+        + period_stats(f"Месяц: {MONTHS[today.month - 1]} {today.year}", month_start, month_end)
+        + "\n\nВыручка — по текущим ценам услуг."
+    )
+
+
+@dp.message(F.text == "Статистика", IsOwner())
+async def owner_stats(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(stats_text(date.today()))
 
 
 @dp.message(F.text == "Клиентское меню", IsStaff())
