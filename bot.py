@@ -1132,13 +1132,14 @@ async def check_reminders(bot: Bot) -> None:
 
 
 async def reminders_loop(bot: Bot) -> None:
-    """Фоновая проверка напоминаний раз в минуту."""
+    """Фоновая проверка напоминаний и просьб оценить визит раз в минуту."""
     while True:
-        try:
-            await check_reminders(bot)
-        except Exception:
-            # Ошибка в одной проверке не должна остановить напоминания совсем
-            logging.exception("Ошибка при проверке напоминаний")
+        # Ошибка в одной проверке не должна остановить проверки совсем
+        for check in (check_reminders, check_reviews):
+            try:
+                await check(bot)
+            except Exception:
+                logging.exception("Ошибка в фоновой проверке %s", check.__name__)
         await asyncio.sleep(60)
 
 
@@ -1218,6 +1219,146 @@ async def reminder_cancel_yes(callback: CallbackQuery) -> None:
     )
     await callback.answer()
     await notify_staff_cancelled(callback.bot, callback.from_user, booking, " (из напоминания)")
+
+
+# ---------------- Оценка визита ----------------
+# Через REVIEW_DELAY после окончания визита (начало + длительность услуги) клиенту приходит просьба
+# оценить его от 1 до 5 и, если хочет, написать отзыв. Оценку и отзыв получают мастер записи и владелец.
+# Отметка об отправке — в колонке review_asked, оценка и отзыв — в rating и review.
+# callback_data кнопок оценки начинается с «rate:»
+
+REVIEW_DELAY = timedelta(hours=2)
+# Если бот долго не работал, просить оценку спустя столько времени уже поздно — только ставим отметку
+REVIEW_TOO_LATE = timedelta(hours=24)
+REVIEW_LIMIT = 1000
+
+
+class Review(StatesGroup):
+    text = State()  # ждём отзыв; в данных FSM — booking_id
+
+
+def booking_end_time(booking) -> datetime:
+    """Конец визита: начало записи + длительность услуги (если услуги уже нет — час)."""
+    minutes = SERVICE_MINUTES.get(booking["service"], 60)
+    return booking_start_time(booking["date"], booking["time"]) + timedelta(minutes=minutes)
+
+
+def stars(rating: int) -> str:
+    return "★" * rating + "☆" * (5 - rating)
+
+
+def review_request_view(booking) -> tuple[str, InlineKeyboardMarkup]:
+    name, _ = SERVICES.get(booking["service"], (booking["service"], 0))
+    day = date.fromisoformat(booking["date"])
+    text = (
+        f"Спасибо, что были у нас! ✂️\n{name}, {format_date(day)} в {booking['time']}, "
+        f"мастер {master_name(booking['master_id'])}.\n\n"
+        "Как прошёл визит? Оцените, пожалуйста, от 1 до 5."
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"{n} ★", callback_data=f"rate:{booking['id']}:{n}")
+                for n in range(1, 6)
+            ]
+        ]
+    )
+    return text, keyboard
+
+
+async def send_review_request(bot: Bot, booking) -> bool:
+    text, keyboard = review_request_view(booking)
+    try:
+        await bot.send_message(booking["user_id"], text, reply_markup=keyboard)
+        return True
+    except TelegramAPIError as error:
+        logging.warning("Не удалось попросить оценку по записи %s: %s", booking["id"], error)
+        return False
+
+
+async def check_reviews(bot: Bot) -> None:
+    """Просит оценить визиты, которые закончились REVIEW_DELAY назад. Смотрим записи за последние
+    2 дня: визит длится меньше суток, а более старые всё равно уже «поздно» (REVIEW_TOO_LATE)."""
+    now = datetime.now()
+    today = now.date()
+    for booking in db.bookings_to_review((today - timedelta(days=2)).isoformat(), today.isoformat()):
+        due = booking_end_time(booking) + REVIEW_DELAY
+        if now < due:
+            continue
+        # Как и с напоминаниями: сначала отметка, потом отправка — дважды не придёт
+        if db.mark_review_asked(booking["id"]) and now - due <= REVIEW_TOO_LATE:
+            await send_review_request(bot, booking)
+
+
+def review_header(booking, user: User) -> str:
+    name, _ = SERVICES.get(booking["service"], (booking["service"], 0))
+    return (
+        f"Мастер: {master_name(booking['master_id'])}\n"
+        f"Услуга: {name}\n"
+        f"Визит: {format_date(date.fromisoformat(booking['date']))} в {booking['time']}\n"
+        f"Клиент: {client_name(user)}"
+    )
+
+
+@dp.callback_query(F.data.startswith("rate:"))
+async def rate_visit(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = callback.data.split(":")
+    booking_id = parse_id(parts[1]) if len(parts) == 3 else None
+    rating = parse_id(parts[2]) if len(parts) == 3 else None
+    if not booking_id or rating not in range(1, 6):
+        await callback.answer("Эта кнопка устарела", show_alert=True)
+        return
+    booking = db.user_booking(booking_id, callback.from_user.id)
+    if booking is None:
+        await callback.answer("Эта запись не найдена", show_alert=True)
+        return
+    if not db.save_rating(booking_id, callback.from_user.id, rating):
+        await callback.answer("Оценка уже сохранена, спасибо!", show_alert=True)
+        return
+    text, _ = review_request_view(booking)
+    await callback.message.edit_text(f"{text.rsplit(chr(10) * 2, 1)[0]}\n\nВаша оценка: {stars(rating)}")
+    await callback.answer("Спасибо!")
+    await notify_staff(
+        callback.bot,
+        [booking["master_id"]],
+        f"⭐ Оценка визита: {rating} из 5 {stars(rating)}\n" + review_header(booking, callback.from_user),
+    )
+    # Отзыв — следующим сообщением клиента (обработчик review_text в конце файла)
+    await state.clear()
+    await state.set_state(Review.text)
+    await state.update_data(booking_id=booking_id)
+    await callback.message.answer(
+        "Если хотите, напишите пару слов о визите одним сообщением — передадим мастеру.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Пропустить", callback_data=f"review_skip:{booking_id}")]]
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("review_skip:"))
+async def review_skip(callback: CallbackQuery, state: FSMContext) -> None:
+    if await state.get_state() == Review.text:
+        await state.clear()
+    await callback.message.edit_text("Хорошо, без отзыва. Спасибо за оценку!")
+    await callback.answer()
+
+
+# /test_review — сразу попросить оценку по своей последней записи (для проверки).
+# Доступно владельцу и мастерам; отметку review_asked не ставит
+@dp.message(Command("test_review"), IsStaff())
+async def test_review(message: Message) -> None:
+    bookings = db.user_bookings(message.from_user.id, "0000-01-01")
+    if not bookings:
+        await message.answer("У вас нет записей. Запишитесь сами (как клиент) и повторите команду.")
+        return
+    booking = db.user_booking(bookings[-1]["id"], message.from_user.id)
+    if not await send_review_request(message.bot, booking):
+        await message.answer("Не удалось отправить просьбу об оценке, см. лог.")
+
+
+@dp.message(Command("test_review"))
+async def test_review_denied(message: Message) -> None:
+    await message.answer("Эта команда доступна только мастеру.")
 
 
 # ---------------- Меню мастера ----------------
@@ -1855,6 +1996,27 @@ async def master_button_denied(callback: CallbackQuery) -> None:
 @dp.callback_query()
 async def outdated_button(callback: CallbackQuery) -> None:
     await callback.answer("Эта кнопка устарела. Нажмите «Записаться» ещё раз.", show_alert=True)
+
+
+# Отзыв после оценки: любой текст клиента в состоянии Review.text.
+# Стоит последним среди обработчиков сообщений, чтобы кнопки меню («Записаться», «Мои записи»,
+# меню мастера) срабатывали как обычно, а не принимались за отзыв
+@dp.message(Review.text, F.text, ~F.text.startswith("/"))
+async def review_text(message: Message, state: FSMContext) -> None:
+    booking_id = (await state.get_data()).get("booking_id")
+    await state.clear()
+    review = " ".join(message.text.split())[:REVIEW_LIMIT]
+    booking = db.user_booking(booking_id, message.from_user.id) if booking_id else None
+    if booking is None or not review or not db.save_review(booking_id, message.from_user.id, review):
+        await message.answer("Отзыв по этой записи уже сохранён. Спасибо!", reply_markup=menu_for(message.from_user))
+        return
+    await message.answer("Спасибо за отзыв! Передали мастеру 🙏", reply_markup=menu_for(message.from_user))
+    rating = f"Оценка: {booking['rating']} из 5 {stars(booking['rating'])}\n" if booking["rating"] else ""
+    await notify_staff(
+        message.bot,
+        [booking["master_id"]],
+        f"💬 Отзыв о визите\n{rating}" + review_header(booking, message.from_user) + f"\n\n«{review}»",
+    )
 
 
 async def main() -> None:

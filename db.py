@@ -90,9 +90,21 @@ def init_db(default_master: str) -> None:
         for column in ("client_name", "client_username", "comment"):
             if column not in columns:
                 conn.execute(f"ALTER TABLE bookings ADD COLUMN {column} TEXT")
-        for column in ("reminded_24h", "reminded_2h", "confirmed"):
+        # review_asked = 1 — просьба оценить визит отправлена (или уже не нужна)
+        for column in ("reminded_24h", "reminded_2h", "confirmed", "review_asked"):
             if column not in columns:
                 conn.execute(f"ALTER TABLE bookings ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+        if "review_asked" not in columns:
+            # Визиты, прошедшие до появления оценок, оценить не просим
+            conn.execute(
+                "UPDATE bookings SET review_asked = 1"
+                " WHERE date || ' ' || time < strftime('%Y-%m-%d %H:%M', 'now', 'localtime')"
+            )
+        # Оценка клиента 1–5 и необязательный отзыв (NULL — ещё не оставил)
+        if "rating" not in columns:
+            conn.execute("ALTER TABLE bookings ADD COLUMN rating INTEGER")
+        if "review" not in columns:
+            conn.execute("ALTER TABLE bookings ADD COLUMN review TEXT")
         # Телефоны клиентов. phone_asked = 1 — номер уже спрашивали (повторно не спрашиваем)
         conn.execute(
             """
@@ -255,7 +267,7 @@ def delete_booking(booking_id: int, user_id: int) -> sqlite3.Row | None:
 # Запись вместе с телефоном клиента (если он им поделился) — для мастера и напоминаний
 BOOKING_COLUMNS = (
     "b.id, b.user_id, b.service, b.master_id, b.date, b.time, b.client_name, b.client_username,"
-    " b.reminded_24h, b.reminded_2h, b.confirmed, b.comment, c.phone"
+    " b.reminded_24h, b.reminded_2h, b.confirmed, b.comment, b.rating, b.review, c.phone"
 )
 BOOKINGS_WITH_PHONE = "bookings b LEFT JOIN clients c ON c.user_id = b.user_id"
 
@@ -424,3 +436,42 @@ def save_phone(user_id: int, phone: str) -> None:
             " ON CONFLICT (user_id) DO UPDATE SET phone = excluded.phone, phone_asked = 1",
             (user_id, phone),
         )
+
+
+def bookings_to_review(from_day: str, to_day: str) -> list[sqlite3.Row]:
+    """Записи с from_day по to_day, по которым ещё не просили оценить визит."""
+    with connect() as conn:
+        return conn.execute(
+            f"SELECT {BOOKING_COLUMNS} FROM {BOOKINGS_WITH_PHONE}"
+            " WHERE date BETWEEN ? AND ? AND review_asked = 0 ORDER BY date, time",
+            (from_day, to_day),
+        ).fetchall()
+
+
+def mark_review_asked(booking_id: int) -> bool:
+    """Отмечает, что просьба об оценке отправлена. False — уже была отмечена."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE bookings SET review_asked = 1 WHERE id = ? AND review_asked = 0", (booking_id,)
+        )
+    return cursor.rowcount == 1
+
+
+def save_rating(booking_id: int, user_id: int, rating: int) -> bool:
+    """Сохраняет оценку клиента. False — запись не его (или её нет) или оценка уже стоит."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE bookings SET rating = ? WHERE id = ? AND user_id = ? AND rating IS NULL",
+            (rating, booking_id, user_id),
+        )
+    return cursor.rowcount == 1
+
+
+def save_review(booking_id: int, user_id: int, review: str) -> bool:
+    """Сохраняет отзыв клиента. False — запись не его (или её нет) или отзыв уже оставлен."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE bookings SET review = ? WHERE id = ? AND user_id = ? AND review IS NULL",
+            (review, booking_id, user_id),
+        )
+    return cursor.rowcount == 1
